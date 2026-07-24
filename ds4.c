@@ -47443,6 +47443,8 @@ static int generate_glm_metal_argmax(
 typedef struct {
     uint32_t ctx_size;
     uint32_t capture_cap;
+    uint32_t cache_cap;
+    uint32_t cache_window;
     uint64_t scratch_bytes;
     uint64_t kv_bytes;
 
@@ -47514,6 +47516,7 @@ typedef struct {
     ds4_gpu_tensor *key_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *value_cache[DS4_MAX_LAYER];
     uint32_t cache_cap[DS4_MAX_LAYER];
+    uint32_t cache_window[DS4_MAX_LAYER];
     ds4_gpu_tensor *dflash_features;
     ds4_gpu_tensor *dflash_target_norm;
     ds4_gpu_tensor *dflash_target_logits;
@@ -47561,6 +47564,7 @@ static void laguna_graph_free(ds4_laguna_gpu_graph *g) {
         g->key_cache[il] = NULL;
         g->value_cache[il] = NULL;
         g->cache_cap[il] = 0;
+        g->cache_window[il] = 0;
     }
     memset(g, 0, sizeof(*g));
 }
@@ -47611,6 +47615,16 @@ static bool dflash_graph_alloc(ds4_dflash_gpu_graph *g, uint32_t ctx_size) {
     memset(g, 0, sizeof(*g));
     g->ctx_size = ctx_size;
     g->capture_cap = ctx_size < 1024u ? ctx_size : 1024u;
+    g->cache_window =
+        ctx_size < DS4_DFLASH_SWA ? ctx_size : DS4_DFLASH_SWA;
+    g->cache_cap = g->cache_window;
+    /* Rejected speculative rows remain outside the live attention window
+     * until their logical positions are either committed or overwritten. */
+    const uint32_t speculative_slack = DS4_DFLASH_BLOCK_SIZE - 1u;
+    if (g->cache_cap < ctx_size) {
+        const uint32_t room = ctx_size - g->cache_cap;
+        g->cache_cap += room < speculative_slack ? room : speculative_slack;
+    }
 
     const uint64_t cap = g->capture_cap;
     const uint64_t block = DS4_DFLASH_BLOCK_SIZE;
@@ -47659,7 +47673,7 @@ static bool dflash_graph_alloc(ds4_dflash_gpu_graph *g, uint32_t ctx_size) {
 #undef DS4_DFLASH_ALLOC
 
     const uint64_t cache_bytes =
-        (uint64_t)DS4_DFLASH_SWA * kv_dim * sizeof(uint16_t);
+        (uint64_t)g->cache_cap * kv_dim * sizeof(uint16_t);
     for (uint32_t il = 0; il < DS4_DFLASH_N_LAYER; il++) {
         g->key_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
         g->value_cache[il] = ds4_gpu_tensor_alloc(cache_bytes);
@@ -47680,7 +47694,8 @@ fail:
     return false;
 }
 
-static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
+static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size,
+                               uint32_t speculative_slack) {
     if (!g || ctx_size == 0 || ctx_size > DS4_CONTEXT_LENGTH ||
         DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_LAGUNA) {
         return false;
@@ -47750,15 +47765,24 @@ static bool laguna_graph_alloc(ds4_laguna_gpu_graph *g, uint32_t ctx_size) {
     }
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        uint32_t cap = ds4_laguna_layer_is_swa(il) ? DS4_N_SWA : ctx_size;
-        if (cap > ctx_size) cap = ctx_size;
-        if (cap == 0) cap = 1;
+        uint32_t window =
+            ds4_laguna_layer_is_swa(il) ? DS4_N_SWA : ctx_size;
+        if (window > ctx_size) window = ctx_size;
+        if (window == 0) window = 1;
+        uint32_t cap = window;
+        /* DFlash verifies at most 16 rows and commits at least the first one.
+         * Fifteen spare rows keep every rejected tail outside the SWA window. */
+        if (ds4_laguna_layer_is_swa(il) && cap < ctx_size) {
+            const uint32_t room = ctx_size - cap;
+            cap += room < speculative_slack ? room : speculative_slack;
+        }
         const uint64_t bytes =
             (uint64_t)cap * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(uint16_t);
         g->key_cache[il] = ds4_gpu_tensor_alloc(bytes);
         g->value_cache[il] = ds4_gpu_tensor_alloc(bytes);
         if (!g->key_cache[il] || !g->value_cache[il]) goto fail;
         g->cache_cap[il] = cap;
+        g->cache_window[il] = window;
         g->kv_bytes += 2u * bytes;
     }
 
@@ -48006,7 +48030,9 @@ static bool laguna_graph_forward_token(
                     DS4_RMS_EPS) != 0;
         }
         uint32_t key_count = pos + 1u;
-        if (key_count > g->cache_cap[il]) key_count = g->cache_cap[il];
+        if (key_count > g->cache_window[il]) {
+            key_count = g->cache_window[il];
+        }
         const uint32_t key_start = pos + 1u - key_count;
         if (ok) {
             ok = ds4_gpu_laguna_store_attention_tensor(
@@ -48482,6 +48508,7 @@ static bool laguna_graph_forward_batch(
                     pos0,
                     n_tokens,
                     g->cache_cap[il],
+                    g->cache_window[il],
                     n_head,
                     DS4_N_HEAD_KV,
                     DS4_N_HEAD_DIM,
@@ -48886,7 +48913,7 @@ static bool dflash_graph_inject(
                     g->v,
                     pos0,
                     n_tokens,
-                    DS4_DFLASH_SWA,
+                    g->cache_cap,
                     DS4_DFLASH_N_HEAD_KV * DS4_DFLASH_HEAD_DIM) != 0;
         }
     }
@@ -49016,7 +49043,8 @@ static bool dflash_graph_draft(
                     g->staged_value,
                     g->q, g->k, g->v, g->gate,
                     pos0, n_tokens,
-                    DS4_DFLASH_SWA,
+                    g->cache_cap,
+                    g->cache_window,
                     DS4_DFLASH_N_HEAD,
                     DS4_DFLASH_N_HEAD_KV,
                     DS4_DFLASH_HEAD_DIM,
@@ -49147,7 +49175,7 @@ static int generate_laguna_gpu_argmax(
         return 1;
     }
     ds4_laguna_gpu_graph g;
-    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size)) return 1;
+    if (!laguna_graph_alloc(&g, (uint32_t)ctx_size, 0u)) return 1;
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
     bool ok = true;
     const double prefill_t0 = now_sec();
@@ -50634,7 +50662,7 @@ static uint32_t session_laguna_layer_live_rows(
         uint32_t                    layer,
         uint32_t                    checkpoint_len) {
     if (!g || layer >= DS4_N_LAYER || layer >= DS4_MAX_LAYER) return 0;
-    uint32_t rows = g->cache_cap[layer];
+    uint32_t rows = g->cache_window[layer];
     if (rows > checkpoint_len) rows = checkpoint_len;
     return rows;
 }
@@ -58304,6 +58332,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = e;
             return 0;
         }
+#ifdef DS4_ROCM_BUILD
+        fprintf(stderr,
+                "ds4: Laguna S 2.1 inference is not implemented for ROCm\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+#endif
         if (e->backend != DS4_BACKEND_METAL &&
             e->backend != DS4_BACKEND_CUDA) {
             fprintf(stderr,
@@ -59556,7 +59591,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->engine = e;
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_LAGUNA) {
-        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size)) {
+        const uint32_t speculative_slack = e->dflash_ready ?
+            DS4_DFLASH_BLOCK_SIZE - 1u : 0u;
+        if (!laguna_graph_alloc(&s->laguna_graph, (uint32_t)ctx_size,
+                                speculative_slack)) {
             free(s);
             return 1;
         }
@@ -66850,6 +66888,7 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
      * while preserving the exact one-token kernels and per-session KV order. */
     if (e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(first) &&
+        !ds4_session_is_laguna(first) &&
         e->support_kind == DS4_SUPPORT_NONE) {
         bool ok = ds4_gpu_begin_commands() != 0;
         for (int i = 0; ok && i < count; i++) {
@@ -66987,6 +67026,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         native_requested &&
         e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(prefill_session) &&
+        !ds4_session_is_laguna(prefill_session) &&
         e->support_kind == DS4_SUPPORT_NONE &&
         metal_graph_mixed_prefill_decode_supported(
                 prefill_session, prefill_prompt, start, prefill_rows,

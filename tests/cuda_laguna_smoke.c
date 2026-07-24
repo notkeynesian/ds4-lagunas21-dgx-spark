@@ -649,12 +649,12 @@ static float softplus(float x) {
 static void attention_ref(float *out,
                           const float *q,
                           const float *keys,
-                          const float *values,
-                          const float *gate,
-                          uint32_t pos0,
-                          uint32_t n_tokens,
-                          uint32_t cache_cap,
-                          uint32_t n_head,
+                           const float *values,
+                           const float *gate,
+                           uint32_t pos0,
+                           uint32_t n_tokens,
+                           uint32_t cache_window,
+                           uint32_t n_head,
                           uint32_t n_head_kv) {
     const uint32_t heads_per_kv = n_head / n_head_kv;
     for (uint32_t t = 0; t < n_tokens; t++) {
@@ -662,7 +662,8 @@ static void attention_ref(float *out,
             const uint32_t kh = h / heads_per_kv;
             const uint32_t query_pos = pos0 + t;
             const uint32_t key_count =
-                query_pos + 1u < cache_cap ? query_pos + 1u : cache_cap;
+                query_pos + 1u < cache_window ?
+                query_pos + 1u : cache_window;
             const uint32_t key_start = query_pos + 1u - key_count;
             float scores[8];
             float max_score = -INFINITY;
@@ -697,7 +698,8 @@ static int check_attention(void) {
     const uint32_t n_tokens = 3;
     const uint32_t n_head = 6;
     const uint32_t n_head_kv = 1;
-    const uint32_t cache_cap = 4;
+    const uint32_t cache_cap = 6;
+    const uint32_t cache_window = 4;
     const uint64_t q_values = (uint64_t)n_tokens * n_head * HEAD_DIM;
     const uint64_t kv_values = (uint64_t)n_tokens * n_head_kv * HEAD_DIM;
     float q[q_values], k[kv_values], v[kv_values], gate[n_tokens * n_head];
@@ -712,7 +714,7 @@ static int check_attention(void) {
             gate[t * n_head + h] = 0.1f * (float)h;
         }
     }
-    attention_ref(expected, q, k, v, gate, 0u, n_tokens, cache_cap,
+    attention_ref(expected, q, k, v, gate, 0u, n_tokens, cache_window,
                   n_head, n_head_kv);
     ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(sizeof(got));
     ds4_gpu_tensor *key_cache =
@@ -736,7 +738,8 @@ static int check_attention(void) {
           "write attention tensors");
     CHECK(ds4_gpu_laguna_attention_prefill_tensor(
                   heads, key_cache, value_cache, staged_key, staged_value,
-                  q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
+                  q_t, k_t, v_t, gate_t, 0u, n_tokens,
+                  cache_cap, cache_window,
                   n_head, n_head_kv, HEAD_DIM,
                   1.0f / sqrtf((float)HEAD_DIM)),
           "Laguna prefill attention");
@@ -817,7 +820,7 @@ static int check_attention(void) {
                v + (uint64_t)t * HEAD_DIM,
                HEAD_DIM * sizeof(float));
     }
-    attention_ref(expected, q, all_k, all_v, gate, 4u, n_tokens, cache_cap,
+    attention_ref(expected, q, all_k, all_v, gate, 4u, n_tokens, cache_window,
                   n_head, n_head_kv);
     CHECK(ds4_gpu_tensor_write(q_t, 0, q, sizeof(q)) &&
           ds4_gpu_tensor_write(k_t, 0, k, sizeof(k)) &&
@@ -826,7 +829,8 @@ static int check_attention(void) {
           "write wrapped prefill tensors");
     CHECK(ds4_gpu_laguna_attention_prefill_tensor(
                   heads, key_cache, value_cache, staged_key, staged_value,
-                  q_t, k_t, v_t, gate_t, 4u, n_tokens, cache_cap,
+                  q_t, k_t, v_t, gate_t, 4u, n_tokens,
+                  cache_cap, cache_window,
                   n_head, n_head_kv, HEAD_DIM,
                   1.0f / sqrtf((float)HEAD_DIM)),
           "Laguna wrapped prefill attention");
@@ -835,6 +839,102 @@ static int check_attention(void) {
     for (uint64_t i = 0; i < q_values; i++) {
         CHECK(close_enough(got[i], expected[i], 5e-4f, 5e-4f),
               "Laguna wrapped prefill attention numeric");
+    }
+
+    ds4_gpu_tensor_free(gate_t);
+    ds4_gpu_tensor_free(v_t);
+    ds4_gpu_tensor_free(k_t);
+    ds4_gpu_tensor_free(q_t);
+    ds4_gpu_tensor_free(staged_value);
+    ds4_gpu_tensor_free(staged_key);
+    ds4_gpu_tensor_free(value_cache);
+    ds4_gpu_tensor_free(key_cache);
+    ds4_gpu_tensor_free(heads);
+    return 0;
+}
+
+static int check_ring_commits(void) {
+    enum {
+        n_tokens = 13,
+        cache_cap = 6,
+        cache_window = 4,
+        n_head = 1,
+        n_head_kv = 1
+    };
+    const uint64_t q_values = (uint64_t)n_tokens * n_head * HEAD_DIM;
+    const uint64_t kv_values =
+        (uint64_t)n_tokens * n_head_kv * HEAD_DIM;
+    float q[q_values], k[kv_values], v[kv_values], gate[n_tokens * n_head];
+    uint16_t key_cache_host[cache_cap * HEAD_DIM];
+    uint16_t value_cache_host[cache_cap * HEAD_DIM];
+    memset(q, 0, sizeof(q));
+    memset(gate, 0, sizeof(gate));
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+            k[(uint64_t)t * HEAD_DIM + d] = (float)(t + 1u);
+            v[(uint64_t)t * HEAD_DIM + d] = (float)(100u + t);
+        }
+    }
+
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(q_values * sizeof(float));
+    ds4_gpu_tensor *key_cache =
+        ds4_gpu_tensor_alloc(sizeof(key_cache_host));
+    ds4_gpu_tensor *value_cache =
+        ds4_gpu_tensor_alloc(sizeof(value_cache_host));
+    ds4_gpu_tensor *staged_key =
+        ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
+    ds4_gpu_tensor *staged_value =
+        ds4_gpu_tensor_alloc(kv_values * sizeof(uint16_t));
+    ds4_gpu_tensor *q_t = ds4_gpu_tensor_alloc(sizeof(q));
+    ds4_gpu_tensor *k_t = ds4_gpu_tensor_alloc(sizeof(k));
+    ds4_gpu_tensor *v_t = ds4_gpu_tensor_alloc(sizeof(v));
+    ds4_gpu_tensor *gate_t = ds4_gpu_tensor_alloc(sizeof(gate));
+    CHECK(heads && key_cache && value_cache && staged_key && staged_value &&
+          q_t && k_t && v_t && gate_t, "ring commit tensor allocation");
+    CHECK(ds4_gpu_tensor_write(q_t, 0, q, sizeof(q)) &&
+          ds4_gpu_tensor_write(k_t, 0, k, sizeof(k)) &&
+          ds4_gpu_tensor_write(v_t, 0, v, sizeof(v)) &&
+          ds4_gpu_tensor_write(gate_t, 0, gate, sizeof(gate)),
+          "write ring commit tensors");
+
+    CHECK(ds4_gpu_laguna_attention_prefill_tensor(
+              heads, key_cache, value_cache, staged_key, staged_value,
+              q_t, k_t, v_t, gate_t, 0u, n_tokens,
+              cache_cap, cache_window, n_head, n_head_kv, HEAD_DIM,
+              1.0f / sqrtf((float)HEAD_DIM)),
+          "Laguna oversized ring commit");
+    CHECK(ds4_gpu_tensor_read(key_cache, 0, key_cache_host,
+                              sizeof(key_cache_host)) &&
+          ds4_gpu_tensor_read(value_cache, 0, value_cache_host,
+                              sizeof(value_cache_host)),
+          "read Laguna oversized ring commit");
+    for (uint32_t t = n_tokens - cache_cap; t < n_tokens; t++) {
+        const uint32_t row = t % cache_cap;
+        CHECK(close_enough(f16_ref(key_cache_host[row * HEAD_DIM]),
+                           (float)(t + 1u), 0.0f, 0.0f),
+              "Laguna oversized ring keeps newest key");
+        CHECK(close_enough(f16_ref(value_cache_host[row * HEAD_DIM]),
+                           (float)(100u + t), 0.0f, 0.0f),
+              "Laguna oversized ring keeps newest value");
+    }
+
+    CHECK(ds4_gpu_dflash_store_kv_tensor(
+              key_cache, value_cache, k_t, v_t, 0u, n_tokens,
+              cache_cap, HEAD_DIM),
+          "DFlash oversized ring commit");
+    CHECK(ds4_gpu_tensor_read(key_cache, 0, key_cache_host,
+                              sizeof(key_cache_host)) &&
+          ds4_gpu_tensor_read(value_cache, 0, value_cache_host,
+                              sizeof(value_cache_host)),
+          "read DFlash oversized ring commit");
+    for (uint32_t t = n_tokens - cache_cap; t < n_tokens; t++) {
+        const uint32_t row = t % cache_cap;
+        CHECK(close_enough(f16_ref(key_cache_host[row * HEAD_DIM]),
+                           (float)(t + 1u), 0.0f, 0.0f),
+              "DFlash oversized ring keeps newest key");
+        CHECK(close_enough(f16_ref(value_cache_host[row * HEAD_DIM]),
+                           (float)(100u + t), 0.0f, 0.0f),
+              "DFlash oversized ring keeps newest value");
     }
 
     ds4_gpu_tensor_free(gate_t);
@@ -900,7 +1000,7 @@ static int check_dflash_blackwell_attention(void) {
           "select portable DFlash attention");
     CHECK(ds4_gpu_laguna_attention_prefill_tensor(
               heads, key_cache, value_cache, staged_key, staged_value,
-              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
+              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap, cache_cap,
               n_head, n_head_kv, HEAD_DIM,
               1.0f / sqrtf((float)HEAD_DIM)) &&
           ds4_gpu_tensor_read(heads, 0, portable, sizeof(portable)),
@@ -911,7 +1011,7 @@ static int check_dflash_blackwell_attention(void) {
           "select untiled Blackwell DFlash attention");
     CHECK(ds4_gpu_laguna_attention_prefill_tensor(
               heads, key_cache, value_cache, staged_key, staged_value,
-              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
+              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap, cache_cap,
               n_head, n_head_kv, HEAD_DIM,
               1.0f / sqrtf((float)HEAD_DIM)) &&
           ds4_gpu_tensor_read(heads, 0, untiled, sizeof(untiled)),
@@ -920,7 +1020,7 @@ static int check_dflash_blackwell_attention(void) {
           "select tiled Blackwell DFlash attention");
     CHECK(ds4_gpu_laguna_attention_prefill_tensor(
               heads, key_cache, value_cache, staged_key, staged_value,
-              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap,
+              q_t, k_t, v_t, gate_t, 0u, n_tokens, cache_cap, cache_cap,
               n_head, n_head_kv, HEAD_DIM,
               1.0f / sqrtf((float)HEAD_DIM)) &&
           ds4_gpu_tensor_read(heads, 0, blackwell, sizeof(blackwell)),
@@ -1445,6 +1545,7 @@ int main(void) {
     }
     if (rc == 0) rc = check_norm_rope(&blob, norm_offset);
     if (rc == 0) rc = check_attention();
+    if (rc == 0) rc = check_ring_commits();
     if (rc == 0) rc = check_dflash_blackwell_attention();
     if (rc == 0) rc = check_long_decode_attention();
     if (rc == 0) rc = check_moe(&blob, &routed, &shared, (float)dim);

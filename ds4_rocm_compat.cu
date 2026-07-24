@@ -431,6 +431,20 @@ extern "C" int ds4_gpu_laguna_qkvg_f16_tensor(
     return 0;
 }
 
+extern "C" int ds4_gpu_laguna_qkvg_q8_0_tensor(
+        ds4_gpu_tensor *q, ds4_gpu_tensor *k, ds4_gpu_tensor *v,
+        ds4_gpu_tensor *gate, const void *model_map, uint64_t model_size,
+        uint64_t q_weight_offset, uint64_t k_weight_offset,
+        uint64_t v_weight_offset, uint64_t gate_weight_offset,
+        uint32_t in_dim, uint32_t q_dim, uint32_t kv_dim,
+        uint32_t gate_dim, const ds4_gpu_tensor *x) {
+    (void)q; (void)k; (void)v; (void)gate; (void)model_map; (void)model_size;
+    (void)q_weight_offset; (void)k_weight_offset; (void)v_weight_offset;
+    (void)gate_weight_offset; (void)in_dim; (void)q_dim; (void)kv_dim;
+    (void)gate_dim; (void)x;
+    return 0;
+}
+
 extern "C" int ds4_gpu_laguna_attn_output_residual_f16_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t in_dim, uint32_t out_dim,
@@ -491,11 +505,13 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         ds4_gpu_tensor *staged_value, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
         const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
-        uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
+        uint32_t cache_cap, uint32_t cache_window,
+        uint32_t n_head, uint32_t n_head_kv,
         uint32_t head_dim, float scale) {
     (void)heads; (void)key_cache; (void)value_cache; (void)staged_key;
     (void)staged_value; (void)q; (void)k; (void)v; (void)gate;
-    (void)pos0; (void)n_tokens; (void)cache_cap; (void)n_head;
+    (void)pos0; (void)n_tokens; (void)cache_cap; (void)cache_window;
+    (void)n_head;
     (void)n_head_kv; (void)head_dim; (void)scale;
     return 0;
 }

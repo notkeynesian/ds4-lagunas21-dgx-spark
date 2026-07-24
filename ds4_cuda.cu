@@ -4286,13 +4286,19 @@ __global__ static void dflash_store_kv_kernel(
         uint32_t cache_cap,
         uint32_t kv_width) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t n = (uint64_t)n_tokens * kv_width;
+    /* A batch may span the ring multiple times. Keep one writer per physical
+     * row and retain the newest logical occurrence. */
+    const uint32_t stored_tokens = n_tokens < cache_cap ? n_tokens : cache_cap;
+    const uint64_t n = (uint64_t)stored_tokens * kv_width;
     if (i >= n) return;
     const uint32_t row = (uint32_t)(i / kv_width);
+    const uint32_t source_row = n_tokens - stored_tokens + row;
     const uint32_t col = (uint32_t)(i % kv_width);
-    const uint64_t dst = (uint64_t)((pos0 + row) % cache_cap) * kv_width + col;
-    key_cache[dst] = __float2half(k[i]);
-    value_cache[dst] = __float2half(v[i]);
+    const uint64_t src = (uint64_t)source_row * kv_width + col;
+    const uint64_t dst =
+        (uint64_t)((pos0 + source_row) % cache_cap) * kv_width + col;
+    key_cache[dst] = __float2half(k[src]);
+    value_cache[dst] = __float2half(v[src]);
 }
 
 __device__ static float warp_sum_f32(float v) {
@@ -13518,7 +13524,8 @@ extern "C" int ds4_gpu_dflash_store_kv_tensor(
         uint32_t pos0, uint32_t n_tokens, uint32_t cache_cap,
         uint32_t kv_width) {
     if (!key_cache || !value_cache || !k || !v || n_tokens == 0u ||
-        cache_cap == 0u || kv_width == 0u) {
+        cache_cap == 0u || kv_width == 0u ||
+        pos0 > UINT32_MAX - n_tokens) {
         return 0;
     }
     const uint64_t values = (uint64_t)n_tokens * kv_width;
@@ -13535,7 +13542,9 @@ extern "C" int ds4_gpu_dflash_store_kv_tensor(
         ds4_tensor_device_idx(v) != tier) {
         return 0;
     }
-    dflash_store_kv_kernel<<<(values + 255u) / 256u, 256>>>(
+    const uint64_t stored_values =
+        (uint64_t)(n_tokens < cache_cap ? n_tokens : cache_cap) * kv_width;
+    dflash_store_kv_kernel<<<(stored_values + 255u) / 256u, 256>>>(
             (__half *)key_cache->ptr,
             (__half *)value_cache->ptr,
             (const float *)k->ptr,
@@ -28730,14 +28739,18 @@ __global__ static void laguna_commit_kv_f16_kernel(
         uint32_t cache_cap,
         uint32_t width) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t values = (uint64_t)n_tokens * width;
+    /* Do not let tokens separated by cache_cap race on the same destination. */
+    const uint32_t stored_tokens = n_tokens < cache_cap ? n_tokens : cache_cap;
+    const uint64_t values = (uint64_t)stored_tokens * width;
     if (i >= values) return;
     const uint32_t token = (uint32_t)(i / width);
+    const uint32_t source_token = n_tokens - stored_tokens + token;
     const uint32_t col = (uint32_t)(i - (uint64_t)token * width);
-    const uint32_t cache_row = (pos0 + token) % cache_cap;
+    const uint32_t cache_row = (pos0 + source_token) % cache_cap;
+    const uint64_t src = (uint64_t)source_token * width + col;
     const uint64_t dst = (uint64_t)cache_row * width + col;
-    key_cache[dst] = staged_key[i];
-    value_cache[dst] = staged_value[i];
+    key_cache[dst] = staged_key[src];
+    value_cache[dst] = staged_value[src];
 }
 
 __global__ static void laguna_attention_decode_kernel(
@@ -28925,6 +28938,7 @@ __global__ static void laguna_attention_prefill_kernel(
         uint32_t pos0,
         uint32_t n_tokens,
         uint32_t cache_cap,
+        uint32_t cache_window,
         uint32_t n_head,
         uint32_t n_head_kv,
         uint32_t head_dim,
@@ -28938,7 +28952,7 @@ __global__ static void laguna_attention_prefill_kernel(
     const uint32_t width = n_head_kv * head_dim;
     const uint32_t query_pos = pos0 + token;
     const uint32_t key_count =
-        query_pos + 1u < cache_cap ? query_pos + 1u : cache_cap;
+        query_pos + 1u < cache_window ? query_pos + 1u : cache_window;
     const uint32_t key_start = query_pos + 1u - key_count;
     const float *qh =
         q + ((uint64_t)token * n_head + head) * head_dim;
@@ -29006,6 +29020,7 @@ __global__ static void laguna_attention_prefill_gqa_kernel(
         uint32_t pos0,
         uint32_t n_tokens,
         uint32_t cache_cap,
+        uint32_t cache_window,
         uint32_t n_head,
         uint32_t n_head_kv,
         uint32_t head_dim,
@@ -29021,7 +29036,7 @@ __global__ static void laguna_attention_prefill_gqa_kernel(
     const uint32_t width = n_head_kv * head_dim;
     const uint32_t query_pos = pos0 + token;
     const uint32_t key_count =
-        query_pos + 1u < cache_cap ? query_pos + 1u : cache_cap;
+        query_pos + 1u < cache_window ? query_pos + 1u : cache_window;
     const uint32_t key_start = query_pos + 1u - key_count;
     __shared__ float reduction[HEADS_PER_KV][128];
     __shared__ float old_scale[HEADS_PER_KV];
@@ -29129,6 +29144,7 @@ __global__ static void laguna_attention_prefill_warp_gqa_kernel(
         uint32_t pos0,
         uint32_t n_tokens,
         uint32_t cache_cap,
+        uint32_t cache_window,
         uint32_t n_head,
         uint32_t n_head_kv,
         uint32_t head_dim,
@@ -29147,7 +29163,7 @@ __global__ static void laguna_attention_prefill_warp_gqa_kernel(
     const uint32_t width = n_head_kv * head_dim;
     const uint32_t query_pos = pos0 + token;
     const uint32_t key_count =
-        query_pos + 1u < cache_cap ? query_pos + 1u : cache_cap;
+        query_pos + 1u < cache_window ? query_pos + 1u : cache_window;
     const uint32_t key_start = query_pos + 1u - key_count;
     const uint32_t head = head0 + head_in_group;
     const float *qh =
@@ -31070,11 +31086,13 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
         ds4_gpu_tensor *staged_value, const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
         const ds4_gpu_tensor *gate, uint32_t pos0, uint32_t n_tokens,
-        uint32_t cache_cap, uint32_t n_head, uint32_t n_head_kv,
+        uint32_t cache_cap, uint32_t cache_window,
+        uint32_t n_head, uint32_t n_head_kv,
         uint32_t head_dim, float scale) {
     if (!heads || !key_cache || !value_cache || !staged_key ||
         !staged_value || !q || !k || !v || !gate ||
-        n_tokens == 0u || cache_cap == 0u ||
+        n_tokens == 0u || cache_cap == 0u || cache_window == 0u ||
+        cache_window > cache_cap ||
         n_head == 0u || n_head_kv == 0u || n_head % n_head_kv != 0u ||
         head_dim != 128u || pos0 > UINT32_MAX - n_tokens ||
         !isfinite(scale)) {
@@ -31127,7 +31145,7 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                 (const __half *)value_cache->ptr, \
                 (const __half *)staged_key->ptr, \
                 (const __half *)staged_value->ptr, \
-                pos0, n_tokens, cache_cap, \
+                pos0, n_tokens, cache_cap, cache_window, \
                 n_head, n_head_kv, head_dim, scale); \
     } while (0)
     if (heads_per_kv == 6u && use_warp_gqa) {
@@ -31154,7 +31172,7 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                 (const __half *)value_cache->ptr,
                 (const __half *)staged_key->ptr,
                 (const __half *)staged_value->ptr,
-                pos0, n_tokens, cache_cap,
+                pos0, n_tokens, cache_cap, cache_window,
                 n_head, n_head_kv, head_dim, scale);
     } else if (heads_per_kv == 9u &&
                cuda_laguna_blackwell_ok() &&
@@ -31173,7 +31191,7 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                 (const __half *)value_cache->ptr,
                 (const __half *)staged_key->ptr,
                 (const __half *)staged_value->ptr,
-                pos0, n_tokens, cache_cap,
+                pos0, n_tokens, cache_cap, cache_window,
                 n_head, n_head_kv, head_dim, scale);
     } else if (heads_per_kv == 3u &&
                getenv("DS4_CUDA_LAGUNA_NO_GQA_PREFILL") == NULL) {
@@ -31186,7 +31204,7 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                 (const __half *)value_cache->ptr,
                 (const __half *)staged_key->ptr,
                 (const __half *)staged_value->ptr,
-                pos0, n_tokens, cache_cap,
+                pos0, n_tokens, cache_cap, cache_window,
                 n_head, n_head_kv, head_dim, scale);
     } else {
             laguna_attention_prefill_kernel<<<
@@ -31198,14 +31216,18 @@ extern "C" int ds4_gpu_laguna_attention_prefill_tensor(
                 (const __half *)value_cache->ptr,
                 (const __half *)staged_key->ptr,
                 (const __half *)staged_value->ptr,
-                pos0, n_tokens, cache_cap,
+                pos0, n_tokens, cache_cap, cache_window,
                 n_head, n_head_kv, head_dim, scale);
     }
 #undef DS4_LAGUNA_WARP_GQA_LAUNCH
     if (!cuda_ok(cudaGetLastError(), "Laguna prefill attention launch")) {
         return 0;
     }
-    laguna_commit_kv_f16_kernel<<<(kv_values + 255u) / 256u, 256>>>(
+    const uint64_t stored_kv_values =
+        (uint64_t)(n_tokens < cache_cap ? n_tokens : cache_cap) *
+        kv_row_values;
+    laguna_commit_kv_f16_kernel<<<
+            (stored_kv_values + 255u) / 256u, 256>>>(
             (__half *)key_cache->ptr,
             (__half *)value_cache->ptr,
             (const __half *)staged_key->ptr,

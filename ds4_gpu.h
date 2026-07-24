@@ -1120,7 +1120,10 @@ int ds4_gpu_laguna_attention_prefill_tensor(
         const ds4_gpu_tensor *gate,
         uint32_t              pos0,
         uint32_t              n_tokens,
+        /* Physical ring capacity may include speculative safety rows. */
         uint32_t              cache_cap,
+        /* Logical attention window; must not exceed cache_cap. */
+        uint32_t              cache_window,
         uint32_t              n_head,
         uint32_t              n_head_kv,
         uint32_t              head_dim,

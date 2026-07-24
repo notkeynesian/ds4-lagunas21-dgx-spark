@@ -31539,6 +31539,7 @@ int ds4_gpu_laguna_attention_prefill_tensor(
         uint32_t              pos0,
         uint32_t              n_tokens,
         uint32_t              cache_cap,
+        uint32_t              cache_window,
         uint32_t              n_head,
         uint32_t              n_head_kv,
         uint32_t              head_dim,
@@ -31546,7 +31547,8 @@ int ds4_gpu_laguna_attention_prefill_tensor(
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !key_cache || !value_cache || !staged_key ||
         !staged_value || !q || !k || !v || !gate || n_tokens == 0 ||
-        pos0 > UINT32_MAX - n_tokens || cache_cap == 0 || n_head == 0 ||
+        pos0 > UINT32_MAX - n_tokens || cache_cap == 0 ||
+        cache_window != cache_cap || n_head == 0 ||
         n_head_kv == 0 || n_head % n_head_kv != 0 || head_dim != 128u ||
         !isfinite(scale) || scale <= 0.0f) {
         return 0;
