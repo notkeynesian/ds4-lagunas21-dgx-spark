@@ -20458,10 +20458,13 @@ __global__ static void moe_gate_up_mid_q4K_tile16_mma_kernel(
             uint32_t w = i - p * words_per_tok;
             ((uint32_t *)sxq[p])[w] = ((const uint32_t *)(xq + (uint64_t)s_tok[p] * xq_blocks))[w];
         }
-        /* zero-fill missing pairs so the A fragments are defined */
-        const uint32_t total_words = 16u * words_per_tok;
-        for (uint32_t i = threadIdx.x + np * words_per_tok; i < total_words; i += blockDim.x) {
-            ((uint32_t *)t16_sh)[i] = 0u;
+        /* sxq has a fixed 16-block row stride. Address missing rows through
+         * that layout instead of flattening xq_blocks-wide logical rows. */
+        const uint32_t missing_words = (16u - np) * words_per_tok;
+        for (uint32_t i = threadIdx.x; i < missing_words; i += blockDim.x) {
+            const uint32_t p = np + i / words_per_tok;
+            const uint32_t w = i % words_per_tok;
+            ((uint32_t *)sxq[p])[w] = 0u;
         }
         __syncthreads();
     }

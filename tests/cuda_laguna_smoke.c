@@ -1359,9 +1359,104 @@ static int check_moe(model_blob *blob,
     return 0;
 }
 
+static int check_q4_tile16_partial(
+        model_blob *blob, const ds4_gpu_laguna_moe_desc *routed) {
+    enum {
+        n_tokens = 136,
+        in_dim = 3072,
+        mid_dim = 256,
+        out_dim = 256,
+        n_expert = 2,
+        n_expert_used = 2
+    };
+    const uint64_t x_values = (uint64_t)n_tokens * in_dim;
+    const uint64_t pair_values = (uint64_t)n_tokens * n_expert_used;
+    const uint64_t out_values = (uint64_t)n_tokens * out_dim;
+    const uint64_t mid_values = pair_values * mid_dim;
+    float *x_host = malloc(x_values * sizeof(*x_host));
+    int32_t *selected_host = malloc(pair_values * sizeof(*selected_host));
+    float *weights_host = malloc(pair_values * sizeof(*weights_host));
+    float *optimized1 = malloc(out_values * sizeof(*optimized1));
+    float *optimized2 = malloc(out_values * sizeof(*optimized2));
+    float *fallback = malloc(out_values * sizeof(*fallback));
+    CHECK(x_host && selected_host && weights_host && optimized1 &&
+          optimized2 && fallback, "production-width Q4 host allocation");
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const float scale = 0.00025f * (float)(1u + t % 11u);
+        for (uint32_t i = 0; i < in_dim; i++) {
+            x_host[(uint64_t)t * in_dim + i] = scale;
+        }
+        selected_host[(uint64_t)t * n_expert_used] = 0;
+        selected_host[(uint64_t)t * n_expert_used + 1u] = 1;
+        weights_host[(uint64_t)t * n_expert_used] = 0.25f;
+        weights_host[(uint64_t)t * n_expert_used + 1u] = 0.75f;
+    }
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(x_values * sizeof(float));
+    ds4_gpu_tensor *selected =
+        ds4_gpu_tensor_alloc(pair_values * sizeof(int32_t));
+    ds4_gpu_tensor *weights =
+        ds4_gpu_tensor_alloc(pair_values * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(out_values * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(mid_values * sizeof(float));
+    CHECK(x && selected && weights && out && mid,
+          "production-width Q4 tensor allocation");
+    CHECK(ds4_gpu_tensor_write(x, 0, x_host, x_values * sizeof(float)) &&
+          ds4_gpu_tensor_write(selected, 0, selected_host,
+                               pair_values * sizeof(int32_t)) &&
+          ds4_gpu_tensor_write(weights, 0, weights_host,
+                               pair_values * sizeof(float)),
+          "write production-width Q4 tensors");
+
+#define RUN_Q4_PARTIAL(dst, label) do { \
+        CHECK(ds4_gpu_glm_routed_moe_batch_tensor( \
+                  out, mid, blob->data, blob->size, \
+                  routed->gate_offset, routed->up_offset, routed->down_offset, \
+                  routed->gate_type, routed->up_type, routed->down_type, \
+                  routed->gate_expert_bytes, routed->gate_row_bytes, \
+                  routed->up_expert_bytes, routed->up_row_bytes, \
+                  routed->down_expert_bytes, routed->down_row_bytes, \
+                  in_dim, mid_dim, out_dim, selected, weights, \
+                  n_expert, n_expert_used, 0u, x, n_tokens, \
+                  n_expert_used * mid_dim, false), label); \
+        CHECK(ds4_gpu_tensor_read(out, 0, dst, \
+                                  out_values * sizeof(float)), label); \
+    } while (0)
+
+    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16") == 0,
+          "enable Laguna Q4 tile16");
+    RUN_Q4_PARTIAL(optimized1, "production-width Q4 tile16 first run");
+    RUN_Q4_PARTIAL(optimized2, "production-width Q4 tile16 second run");
+    CHECK(setenv("DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16", "1", 1) == 0,
+          "disable Laguna Q4 tile16");
+    RUN_Q4_PARTIAL(fallback, "production-width Q4 tile8 rollback");
+    CHECK(unsetenv("DS4_CUDA_LAGUNA_NO_Q4_MMA_TILE16") == 0,
+          "restore Laguna Q4 tile16");
+    for (uint64_t i = 0; i < out_values; i++) {
+        CHECK(close_enough(optimized1[i], optimized2[i], 1e-6f, 1e-6f),
+              "production-width Q4 tile16 repeatability");
+        CHECK(close_enough(optimized1[i], fallback[i], 1e-6f, 1e-6f),
+              "production-width Q4 tile16 rollback equivalence");
+    }
+#undef RUN_Q4_PARTIAL
+
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(x);
+    free(fallback);
+    free(optimized2);
+    free(optimized1);
+    free(weights_host);
+    free(selected_host);
+    free(x_host);
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init(), "ds4_gpu_init");
-    const uint64_t blob_size = 2u * 1024u * 1024u;
+    const uint64_t blob_size = 8u * 1024u * 1024u;
     void *host = NULL;
     CHECK(cudaMallocHost(&host, blob_size) == cudaSuccess,
           "allocate pinned model blob");
@@ -1481,6 +1576,34 @@ int main(void) {
     q3_shared.gate_offset = blob_alloc(&blob, q3_matrix_bytes);
     q3_shared.up_offset = blob_alloc(&blob, q3_matrix_bytes);
     q3_shared.down_offset = blob_alloc(&blob, q3_matrix_bytes);
+    enum {
+        production_in_dim = 3072,
+        production_mid_dim = 256,
+        production_out_dim = 256,
+        production_experts = 2,
+        production_in_blocks = production_in_dim / QK_K,
+        production_mid_blocks = production_mid_dim / QK_K
+    };
+    ds4_gpu_laguna_moe_desc production_q4 = {0};
+    production_q4.gate_row_bytes =
+        production_in_blocks * sizeof(block_q4_K);
+    production_q4.gate_expert_bytes =
+        production_mid_dim * production_q4.gate_row_bytes;
+    production_q4.up_row_bytes = production_q4.gate_row_bytes;
+    production_q4.up_expert_bytes = production_q4.gate_expert_bytes;
+    production_q4.down_row_bytes =
+        production_mid_blocks * sizeof(block_q4_K);
+    production_q4.down_expert_bytes =
+        production_out_dim * production_q4.down_row_bytes;
+    production_q4.gate_offset = blob_alloc(
+        &blob, production_experts * production_q4.gate_expert_bytes);
+    production_q4.up_offset = blob_alloc(
+        &blob, production_experts * production_q4.up_expert_bytes);
+    production_q4.down_offset = blob_alloc(
+        &blob, production_experts * production_q4.down_expert_bytes);
+    production_q4.gate_type = 12u;
+    production_q4.up_type = 12u;
+    production_q4.down_type = 12u;
     CHECK(routed.gate_offset != UINT64_MAX &&
           routed.up_offset != UINT64_MAX &&
           routed.down_offset != UINT64_MAX &&
@@ -1500,9 +1623,12 @@ int main(void) {
           q3_routed.gate_offset != UINT64_MAX &&
           q3_routed.up_offset != UINT64_MAX &&
           q3_routed.down_offset != UINT64_MAX &&
-          q3_shared.gate_offset != UINT64_MAX &&
-          q3_shared.up_offset != UINT64_MAX &&
-          q3_shared.down_offset != UINT64_MAX,
+           q3_shared.gate_offset != UINT64_MAX &&
+           q3_shared.up_offset != UINT64_MAX &&
+           q3_shared.down_offset != UINT64_MAX &&
+           production_q4.gate_offset != UINT64_MAX &&
+           production_q4.up_offset != UINT64_MAX &&
+           production_q4.down_offset != UINT64_MAX,
           "allocate MoE model ranges");
     fill_q4_ones(blob.data + routed.gate_offset,
                  2u * dim);
@@ -1530,6 +1656,15 @@ int main(void) {
     fill_q3_pattern(blob.data + q3_shared.gate_offset, dim);
     fill_q3_pattern(blob.data + q3_shared.up_offset, dim);
     fill_q3_pattern(blob.data + q3_shared.down_offset, dim);
+    fill_q4_ones(blob.data + production_q4.gate_offset,
+                 (uint64_t)production_experts * production_mid_dim *
+                     production_in_blocks);
+    fill_q4_ones(blob.data + production_q4.up_offset,
+                 (uint64_t)production_experts * production_mid_dim *
+                     production_in_blocks);
+    fill_q4_ones(blob.data + production_q4.down_offset,
+                 (uint64_t)production_experts * production_out_dim *
+                     production_mid_blocks);
     float q3_row_sum = 0.0f;
     const block_q3_K *q3_row =
         (const block_q3_K *)(blob.data + q3_routed.gate_offset);
@@ -1559,6 +1694,7 @@ int main(void) {
     if (rc == 0) {
         rc = check_moe(&blob, &q3_routed, &q3_shared, q3_row_sum);
     }
+    if (rc == 0) rc = check_q4_tile16_partial(&blob, &production_q4);
     ds4_gpu_cleanup();
     (void)cudaFreeHost(host);
     if (rc == 0) puts("cuda Laguna regression: OK");
