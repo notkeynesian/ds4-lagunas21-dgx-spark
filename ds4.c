@@ -67079,6 +67079,13 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 }
 
 #ifndef DS4_NO_GPU
+static bool ds4_dflash_approx_verify_enabled(void) {
+    const char *env = getenv("DS4_DFLASH_APPROX_VERIFY");
+    return env && env[0] &&
+           (strcmp(env, "1") == 0 || strcasecmp(env, "true") == 0 ||
+            strcasecmp(env, "yes") == 0 || strcasecmp(env, "on") == 0);
+}
+
 static bool ds4_dflash_adaptive_enabled(void) {
     const char *env = getenv("DS4_DFLASH_ADAPTIVE");
     return !env || !env[0] ||
@@ -67147,13 +67154,15 @@ static int ds4_session_eval_dflash_argmax(
         int          first_token,
         int          max_tokens,
         int          eos_token,
+        ds4_think_mode think_mode,
         int         *accepted,
         int          accepted_cap,
         char        *err,
         size_t       errlen) {
     ds4_engine *e = s->engine;
     const uint32_t ceiling = (uint32_t)e->mtp_draft_tokens;
-    const bool adaptive = ds4_dflash_adaptive_enabled();
+    const bool approximate_verify = ds4_dflash_approx_verify_enabled();
+    const bool adaptive = approximate_verify && ds4_dflash_adaptive_enabled();
     if (adaptive &&
         (!s->dflash_adapt_initialized ||
          s->dflash_adapt_next_pos != (uint32_t)s->checkpoint.len)) {
@@ -67203,6 +67212,44 @@ static int ds4_session_eval_dflash_argmax(
             draft_n = i + 1;
             break;
         }
+    }
+
+    if (!approximate_verify) {
+        int matched = 0;
+        int n_accept = 0;
+        int token = first_token;
+        const double target_start = now_sec();
+        for (;;) {
+            if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
+            accepted[n_accept++] = token;
+            if (matched >= draft_n) break;
+            if (sample_argmax(s->logits, DS4_N_VOCAB) != drafts[matched]) {
+                break;
+            }
+            token = drafts[matched++];
+            if (eos_token >= 0 &&
+                ds4_token_is_stop_for_think_mode(e, token, think_mode)) {
+                accepted[n_accept++] = token;
+                break;
+            }
+        }
+        const double target_done = now_sec();
+        s->dflash_adapt_next_pos = (uint32_t)s->checkpoint.len;
+        if (getenv("DS4_DFLASH_LOG")) {
+            const double cycle_ms = (target_done - t0) * 1000.0;
+            fprintf(stderr,
+                    "ds4: DFlash verify=exact drafted=%d matched=%d "
+                    "committed=%d depth=%u draft=%.3f ms target=%.3f ms "
+                    "total=%.3f ms\n",
+                    draft_n,
+                    matched,
+                    n_accept,
+                    requested_depth,
+                    (td - t0) * 1000.0,
+                    (target_done - target_start) * 1000.0,
+                    cycle_ms);
+        }
+        return n_accept;
     }
 
     const int start = s->checkpoint.len;
@@ -67356,6 +67403,7 @@ static int ds4_session_eval_dflash_argmax(
 
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
+                                        ds4_think_mode think_mode,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
@@ -67405,7 +67453,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     }
 #ifdef DS4_NO_GPU
     (void)s; (void)first_token; (void)max_tokens; (void)eos_token;
-    (void)accepted; (void)accepted_cap;
+    (void)think_mode; (void)accepted; (void)accepted_cap;
     snprintf(err, errlen, "GPU support is not compiled in");
     return -1;
 #else
@@ -67416,6 +67464,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                               first_token,
                                               max_tokens,
                                               eos_token,
+                                              think_mode,
                                               accepted,
                                               accepted_cap,
                                               err,

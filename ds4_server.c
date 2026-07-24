@@ -11647,6 +11647,7 @@ decode_again:
                                                        token,
                                                        max_tokens - completion,
                                                        ds4_token_eos(s->engine),
+                                                       j->req.think_mode,
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,

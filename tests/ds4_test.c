@@ -6791,7 +6791,7 @@ static bool test_mtp_capture_speculative(ds4_engine *engine, const ds4_tokens *p
 
         int toks[17]; /* base token + draft depth, which the engine clamps to 16 */
         const int ntok = ds4_session_eval_speculative_argmax(
-            session, token, max_tokens - n, eos, toks,
+            session, token, max_tokens - n, eos, DS4_THINK_HIGH, toks,
             (int)(sizeof(toks) / sizeof(toks[0])), err, sizeof(err));
         if (ntok < 0) { ok = false; TEST_ASSERT(false); break; }
         if (ntok > *max_chunk) *max_chunk = ntok;

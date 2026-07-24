@@ -770,6 +770,7 @@ int main(int argc, char **argv) {
                         token,
                         cfg.gen_tokens - gen_done,
                         -1,
+                        DS4_THINK_HIGH,
                         cycle_tokens,
                         (int)(sizeof(cycle_tokens) /
                               sizeof(cycle_tokens[0])),

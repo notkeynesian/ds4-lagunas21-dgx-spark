@@ -200,7 +200,8 @@ CUDA also supports Poolside's official BF16 DFlash drafter with either the Q4
 or mixed Q2_K/Q3_K target. The DFlash GGUF
 captures six target-layer residual streams, fuses them into a six-layer
 block-diffusion decoder, and verifies up to 15 proposed tokens in one target
-batch. Greedy decoding remains target-verified:
+cycle. By default, verification reuses Laguna's ordinary one-token decode path
+so accepted tokens and KV state remain serial-target equivalent:
 
 ```sh
 ./download_model.sh laguna-dflash
@@ -208,14 +209,15 @@ batch. Greedy decoding remains target-verified:
   --mtp gguf/laguna-s-2.1-DFlash-BF16.gguf --mtp-draft 15 --temp 0
 ```
 
-`--mtp-draft` defaults to 15 for this drafter and sets the adaptive scheduler's
-ceiling. Each session calibrates ordinary target decode, starts speculation at
-depth four, backs off when verified cost per committed token is worse, and
-grows after repeated full, profitable accepts. Set `DS4_DFLASH_ADAPTIVE=0` to
-use the fixed requested depth. DFlash needs roughly another 2.1 GiB for weights
-plus its graph buffers. It is not enabled automatically because throughput
-depends on draft acceptance for the workload and on the cost of the target's
-small verification batches.
+`--mtp-draft` defaults to 15 for this drafter. Exact verification is the
+correctness reference and may not improve throughput yet because accepted rows
+are evaluated with the serial target kernels. `DS4_DFLASH_APPROX_VERIFY=1`
+restores the experimental batched verifier, whose multi-row CUDA arithmetic can
+produce a different greedy continuation than serial target decode. In that
+mode, the adaptive scheduler starts at depth four, backs off when verified cost
+per committed token is worse, and grows after repeated full, profitable
+accepts; `DS4_DFLASH_ADAPTIVE=0` uses the fixed requested depth. DFlash needs
+roughly another 2.1 GiB for weights plus its graph buffers.
 
 On Blackwell GPUs, DFlash also groups its nine query heads per KV head into one
 attention block so each sliding-window K/V row is loaded once per group.

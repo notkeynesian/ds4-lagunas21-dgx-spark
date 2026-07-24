@@ -405,6 +405,7 @@ int ds4_sessions_eval_batch_with_prefill(
         char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
+                                        ds4_think_mode think_mode,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
