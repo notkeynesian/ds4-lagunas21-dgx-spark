@@ -375,6 +375,14 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
                            float *prob_scratch);
+int ds4_test_apply_laguna_dry(float *logits, uint32_t n_vocab,
+                               const int *history, int history_len,
+                               const int *breakers, int n_breakers);
+int ds4_test_sample_laguna_logits(
+        const float *logits, uint32_t n_vocab,
+        float temperature, int top_k, float top_p, float min_p,
+        const int *history, int history_len,
+        const int *breakers, int n_breakers, uint64_t *rng);
 uint64_t ds4_test_mixed_native_count(void);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);

@@ -253,6 +253,15 @@ always take precedence. Use `--nothink` or the `laguna-s-2.1-chat` server alias
 for direct replies, and preserve reasoning content between tool calls when
 building a client.
 
+Laguna also uses the community DRY recipe: multiplier 0.8, base 1.75, allowed
+length 3, and the full context (`penalty_last_n=-1`), with newline, colon,
+double quote, asterisk, semicolon, and left/right braces as sequence breakers.
+Its sampler order is top-k, top-p, min-p, temperature, DRY, then distribution.
+The DRY repetition algorithm and breaker semantics are derived from
+[`llama.cpp`](https://github.com/ggml-org/llama.cpp) and its community recipe;
+Laguna retains this chain while emitting native tool stanzas so DRY can break
+structural loops. Other model families retain their existing sampling behavior.
+
 Then build:
 
 ```sh

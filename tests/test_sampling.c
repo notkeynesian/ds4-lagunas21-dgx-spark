@@ -227,6 +227,143 @@ static void compare_case(const float *logits, float *scratch, uint32_t n,
     }
 }
 
+static void test_dry_allowed_length(void) {
+    float logits[16] = {0};
+    const int short_history[] = {1, 2, 1, 2};
+    CHECK(ds4_test_apply_laguna_dry(
+              logits, 16, short_history,
+              (int)(sizeof(short_history) / sizeof(short_history[0])), NULL, 0),
+          "DRY short-history hook failed");
+    CHECK(logits[1] == 0.0f,
+          "DRY penalized a repetition shorter than the allowed length: %.9g",
+          logits[1]);
+
+    const int allowed_history[] = {1, 2, 3, 1, 2, 3};
+    memset(logits, 0, sizeof(logits));
+    CHECK(ds4_test_apply_laguna_dry(
+              logits, 16, allowed_history,
+              (int)(sizeof(allowed_history) / sizeof(allowed_history[0])),
+              NULL, 0),
+          "DRY allowed-length hook failed");
+    CHECK(fabsf(logits[1] + 0.8f) < 1.0e-6f,
+          "DRY first penalty should be multiplier 0.8, got %.9g", logits[1]);
+    CHECK(logits[2] == 0.0f && logits[3] == 0.0f,
+          "DRY allowed-length case penalized unrelated tokens");
+}
+
+static void test_dry_exponential_penalty(void) {
+    float logits[16] = {0};
+    const int history4[] = {1, 2, 3, 4, 1, 2, 3, 4};
+    CHECK(ds4_test_apply_laguna_dry(
+              logits, 16, history4,
+              (int)(sizeof(history4) / sizeof(history4[0])), NULL, 0),
+          "DRY exponent-one hook failed");
+    CHECK(fabsf(logits[1] + 1.4f) < 1.0e-6f,
+          "DRY exponent-one penalty should be 1.4, got %.9g", logits[1]);
+
+    const int history5[] = {1, 2, 3, 4, 5, 1, 2, 3, 4, 5};
+    memset(logits, 0, sizeof(logits));
+    CHECK(ds4_test_apply_laguna_dry(
+              logits, 16, history5,
+              (int)(sizeof(history5) / sizeof(history5[0])), NULL, 0),
+          "DRY exponent-two hook failed");
+    CHECK(fabsf(logits[1] + 2.45f) < 1.0e-6f,
+          "DRY exponent-two penalty should be 2.45, got %.9g", logits[1]);
+}
+
+static void test_dry_breakers(void) {
+    const int history[] = {1, 2, 9, 3, 4, 5, 1, 2, 9, 3, 4};
+    const int breaker[] = {9};
+    float unbroken[16] = {0};
+    float broken[16] = {0};
+    CHECK(ds4_test_apply_laguna_dry(
+              unbroken, 16, history,
+              (int)(sizeof(history) / sizeof(history[0])), NULL, 0),
+          "DRY unbroken control hook failed");
+    CHECK(ds4_test_apply_laguna_dry(
+              broken, 16, history,
+              (int)(sizeof(history) / sizeof(history[0])), breaker, 1),
+          "DRY breaker reset hook failed");
+    CHECK(fabsf(unbroken[5] + 2.45f) < 1.0e-6f,
+          "DRY breaker control penalty mismatch: %.9g", unbroken[5]);
+    CHECK(broken[5] == 0.0f,
+          "DRY breaker did not limit repetition history: %.9g", broken[5]);
+
+    const int breaker_candidate_history[] = {1, 2, 3, 9, 1, 2, 3};
+    memset(unbroken, 0, sizeof(unbroken));
+    memset(broken, 0, sizeof(broken));
+    CHECK(ds4_test_apply_laguna_dry(
+              unbroken, 16, breaker_candidate_history,
+              (int)(sizeof(breaker_candidate_history) /
+                    sizeof(breaker_candidate_history[0])), NULL, 0),
+          "DRY breaker-candidate control hook failed");
+    CHECK(ds4_test_apply_laguna_dry(
+              broken, 16, breaker_candidate_history,
+              (int)(sizeof(breaker_candidate_history) /
+                    sizeof(breaker_candidate_history[0])), breaker, 1),
+          "DRY breaker-candidate hook failed");
+    CHECK(fabsf(unbroken[9] + 0.8f) < 1.0e-6f,
+          "DRY breaker-candidate control penalty mismatch: %.9g", unbroken[9]);
+    CHECK(broken[9] == 0.0f,
+          "DRY penalized a single-token breaker candidate: %.9g", broken[9]);
+}
+
+static void test_laguna_sampler_edges(void) {
+    const float logits[] = {2.0f, 1.0f, 0.0f};
+    const int history[] = {0, 1, 2, 0, 1, 2};
+    uint64_t rng = 123;
+    const uint64_t initial_rng = rng;
+    int token = ds4_test_sample_laguna_logits(
+        logits, 3, 0.7f, 3, 0.0f, 0.0f,
+        history, (int)(sizeof(history) / sizeof(history[0])),
+        NULL, 0, &rng);
+    CHECK(token == 0, "Laguna top-p zero should retain only top token, got %d",
+          token);
+    CHECK(rng == initial_rng,
+          "Laguna single-candidate sampling unexpectedly advanced RNG");
+
+    rng = 456;
+    const uint64_t greedy_rng = rng;
+    token = ds4_test_sample_laguna_logits(
+        logits, 3, 0.0f, 3, 1.0f, 0.0f,
+        history, (int)(sizeof(history) / sizeof(history[0])),
+        NULL, 0, &rng);
+    CHECK(token == 0, "Laguna greedy sampling should retain raw argmax, got %d",
+          token);
+    CHECK(rng == greedy_rng, "Laguna greedy sampling unexpectedly advanced RNG");
+}
+
+static void test_laguna_sampler_dry_integration(void) {
+    const float logits[] = {0.0f, 0.1f, -10.0f, -10.0f, 0.0f};
+    const int history[] = {1, 2, 3, 1, 2, 3};
+    const int breaker[] = {1};
+    bool changed = false;
+    for (uint64_t seed = 0; seed < 256; seed++) {
+        uint64_t baseline_rng = seed;
+        uint64_t dry_rng = seed;
+        uint64_t breaker_rng = seed;
+        const int baseline = ds4_test_sample_laguna_logits(
+            logits, 5, 1.0f, 2, 1.0f, 0.0f,
+            NULL, 0, NULL, 0, &baseline_rng);
+        const int dry = ds4_test_sample_laguna_logits(
+            logits, 5, 1.0f, 2, 1.0f, 0.0f,
+            history, (int)(sizeof(history) / sizeof(history[0])),
+            NULL, 0, &dry_rng);
+        const int with_breaker = ds4_test_sample_laguna_logits(
+            logits, 5, 1.0f, 2, 1.0f, 0.0f,
+            history, (int)(sizeof(history) / sizeof(history[0])),
+            breaker, 1, &breaker_rng);
+        CHECK(baseline == with_breaker,
+              "Laguna breaker integration changed seed=%llu token %d -> %d",
+              (unsigned long long)seed, baseline, with_breaker);
+        CHECK(baseline_rng == breaker_rng,
+              "Laguna breaker integration changed RNG for seed=%llu",
+              (unsigned long long)seed);
+        if (baseline == 1 && dry == 0) changed = true;
+    }
+    CHECK(changed, "Laguna DRY integration never changed a repeated winner");
+}
+
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -234,6 +371,12 @@ static double now_sec(void) {
 }
 
 int main(void) {
+    test_dry_allowed_length();
+    test_dry_exponential_penalty();
+    test_dry_breakers();
+    test_laguna_sampler_edges();
+    test_laguna_sampler_dry_integration();
+
     const uint32_t semantic_n = 4096;
     float *logits = malloc((size_t)semantic_n * sizeof(*logits));
     float *scratch = malloc((size_t)semantic_n * sizeof(*scratch));

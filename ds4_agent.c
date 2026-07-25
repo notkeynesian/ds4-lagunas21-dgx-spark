@@ -8614,7 +8614,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         bool status_greedy_sampling = false;
         while (generated < max_tokens && !worker_should_interrupt(w)) {
             worker_apply_pending_power(w);
-            bool greedy_sampling = agent_stream_wants_greedy_sampling(&stream);
+            /* Laguna's community anti-loop recipe applies its stochastic DRY
+             * chain to the complete native tool stanza. Other families retain
+             * structural argmax decoding for machine-readable syntax. */
+            bool greedy_sampling =
+                agent_stream_wants_greedy_sampling(&stream) &&
+                !ds4_engine_is_laguna(w->engine);
             if (greedy_sampling != status_greedy_sampling) {
                 worker_set_greedy_sampling(w, greedy_sampling);
                 status_greedy_sampling = greedy_sampling;

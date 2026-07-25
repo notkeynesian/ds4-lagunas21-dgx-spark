@@ -11659,7 +11659,9 @@ decode_again:
             if (!j->req.top_p_set) top_p = default_top_p;
             if (!j->req.min_p_set) min_p = default_min_p;
         }
-        if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
+        if (in_tool_call &&
+            !dsml_decode_state_uses_payload_sampling(dsml_state) &&
+            !ds4_engine_is_laguna(s->engine)) {
             temperature = 0.0f;
         }
         int token = ds4_session_sample(slot->session, temperature, top_k,

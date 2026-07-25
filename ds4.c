@@ -35941,6 +35941,7 @@ struct ds4_engine {
     bool metal_ready;
     bool mtp_ready;
     bool dflash_ready;
+    uint8_t *laguna_dry_breaker;
     bool share_session_prefill_workspace;
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
@@ -37306,6 +37307,29 @@ static int gpt2_codepoint_to_byte(uint32_t cp) {
     return -1;
 }
 
+static bool laguna_dry_breaker_byte(int byte) {
+    return byte == '\n' || byte == ':' || byte == '"' || byte == '*' ||
+           byte == ';' || byte == '{' || byte == '}';
+}
+
+static void laguna_dry_init_breakers(ds4_engine *e) {
+    if (!e || e->laguna_dry_breaker || e->vocab.n_vocab <= 0) return;
+    e->laguna_dry_breaker =
+        xcalloc((size_t)e->vocab.n_vocab, sizeof(e->laguna_dry_breaker[0]));
+    for (int token = 0; token < e->vocab.n_vocab; token++) {
+        const ds4_str piece = e->vocab.token[token];
+        uint64_t pos = 0;
+        while (pos < piece.len) {
+            const uint32_t cp = utf8_decode_one(piece.ptr, piece.len, &pos);
+            const int byte = cp == '\n' ? '\n' : gpt2_codepoint_to_byte(cp);
+            if (laguna_dry_breaker_byte(byte)) {
+                e->laguna_dry_breaker[token] = 1;
+                break;
+            }
+        }
+    }
+}
+
 static bool vocab_token_is_literal_special(ds4_str s) {
     const unsigned char bar[] = {0xef, 0xbd, 0x9c}; /* U+FF5C fullwidth vertical bar. */
     if (s.len < sizeof(bar)) return false;
@@ -37482,6 +37506,14 @@ typedef struct {
     float logit;
     float prob;
 } sample_candidate;
+
+enum {
+    LAGUNA_DRY_ALLOWED_LENGTH = 3,
+    LAGUNA_SAMPLE_STACK_CAP = 64,
+};
+
+#define LAGUNA_DRY_MULTIPLIER 0.8f
+#define LAGUNA_DRY_BASE 1.75f
 
 static int sample_candidate_cmp_desc(const void *a, const void *b) {
     const sample_candidate *ca = a;
@@ -37850,6 +37882,253 @@ static int sample_top_p_min_p(
     return ids[filtered - 1];
 }
 
+static int laguna_history_rat(const int *history, int history_len, int index) {
+    return history[history_len - index - 1];
+}
+
+static bool laguna_dry_is_breaker(
+        int            token,
+        const uint8_t *breaker_flags,
+        uint32_t       n_vocab,
+        const int     *test_breakers,
+        int            n_test_breakers) {
+    if (breaker_flags && token >= 0 && (uint32_t)token < n_vocab) {
+        return breaker_flags[token] != 0;
+    }
+    for (int i = 0; i < n_test_breakers; i++) {
+        if (test_breakers[i] == token) return true;
+    }
+    return false;
+}
+
+/* llama.cpp's DRY reverse Z-algorithm, specialized for single-token breakers.
+ * The Laguna recipe uses only one-byte breaker strings; llama.cpp treats every
+ * vocabulary piece containing one of those bytes as a single-token breaker. */
+static void laguna_apply_dry(
+        sample_candidate *cand,
+        int               n_cand,
+        const int        *history,
+        int               history_len,
+        const uint8_t    *breaker_flags,
+        uint32_t          n_vocab,
+        const int        *test_breakers,
+        int               n_test_breakers,
+        int              *repeat_count) {
+    if (!cand || n_cand <= 0 || !history ||
+        history_len <= LAGUNA_DRY_ALLOWED_LENGTH || !repeat_count) {
+        return;
+    }
+
+    memset(repeat_count, 0, (size_t)history_len * sizeof(repeat_count[0]));
+    int rep_limit = history_len;
+    for (int i = 0; i < history_len; i++) {
+        if (laguna_dry_is_breaker(laguna_history_rat(history, history_len, i),
+                                  breaker_flags, n_vocab,
+                                  test_breakers, n_test_breakers)) {
+            rep_limit = i;
+            break;
+        }
+    }
+    if (rep_limit < LAGUNA_DRY_ALLOWED_LENGTH) return;
+
+    const int last = history_len - 1;
+    int right = 0;
+    int left = 0;
+    for (int k = 1; k < history_len; k++) {
+        if (k > right) {
+            int n = 0;
+            while (n + k < history_len &&
+                   laguna_history_rat(history, history_len, n) ==
+                       laguna_history_rat(history, history_len, n + k)) {
+                n++;
+            }
+            repeat_count[last - k] = n < rep_limit ? n : rep_limit;
+            if (n > 0) {
+                left = k;
+                right = k + n - 1;
+            }
+        } else {
+            const int pair = k - left;
+            const int right_len = right - k + 1;
+            if (repeat_count[last - pair] < right_len) {
+                const int n = repeat_count[last - pair];
+                repeat_count[last - k] = n < rep_limit ? n : rep_limit;
+            } else {
+                int i = right + 1;
+                while (i < history_len &&
+                       laguna_history_rat(history, history_len, i) ==
+                           laguna_history_rat(history, history_len, i - k)) {
+                    i++;
+                }
+                const int n = i - k;
+                repeat_count[last - k] = n < rep_limit ? n : rep_limit;
+                left = k;
+                right = i - 1;
+            }
+        }
+    }
+
+    size_t lookup_cap = 1;
+    while (lookup_cap < (size_t)n_cand * 2u) lookup_cap <<= 1;
+    int stack_lookup[LAGUNA_SAMPLE_STACK_CAP * 2];
+    int stack_max_repeat[LAGUNA_SAMPLE_STACK_CAP];
+    const bool owned = n_cand > LAGUNA_SAMPLE_STACK_CAP;
+    int *lookup = owned ? xcalloc(lookup_cap, sizeof(lookup[0])) : stack_lookup;
+    int *max_repeat = owned ? xcalloc((size_t)n_cand, sizeof(max_repeat[0])) :
+                              stack_max_repeat;
+    if (!owned) {
+        memset(lookup, 0, lookup_cap * sizeof(lookup[0]));
+        memset(max_repeat, 0, (size_t)n_cand * sizeof(max_repeat[0]));
+    }
+    const size_t lookup_mask = lookup_cap - 1u;
+    for (int i = 0; i < n_cand; i++) {
+        size_t slot = ((uint32_t)cand[i].id * 2654435761u) & lookup_mask;
+        while (lookup[slot] != 0) slot = (slot + 1u) & lookup_mask;
+        lookup[slot] = i + 1;
+    }
+
+    for (int i = 0; i < history_len - 1; i++) {
+        const int repeat_len = repeat_count[i];
+        if (repeat_len < LAGUNA_DRY_ALLOWED_LENGTH) continue;
+        const int token = history[i + 1];
+        size_t slot = ((uint32_t)token * 2654435761u) & lookup_mask;
+        while (lookup[slot] != 0) {
+            const int candidate = lookup[slot] - 1;
+            if (cand[candidate].id == token) {
+                if (max_repeat[candidate] < repeat_len) {
+                    max_repeat[candidate] = repeat_len;
+                }
+                break;
+            }
+            slot = (slot + 1u) & lookup_mask;
+        }
+    }
+
+    const int max_exponent = (int)(88.7228391f / logf(LAGUNA_DRY_BASE));
+    for (int i = 0; i < n_cand; i++) {
+        if (max_repeat[i] < LAGUNA_DRY_ALLOWED_LENGTH ||
+            laguna_dry_is_breaker(cand[i].id, breaker_flags, n_vocab,
+                                  test_breakers, n_test_breakers)) {
+            continue;
+        }
+        int exponent = max_repeat[i] - LAGUNA_DRY_ALLOWED_LENGTH;
+        if (exponent > max_exponent) exponent = max_exponent;
+        cand[i].logit -= LAGUNA_DRY_MULTIPLIER *
+                         powf(LAGUNA_DRY_BASE, (float)exponent);
+    }
+    if (owned) {
+        free(max_repeat);
+        free(lookup);
+    }
+}
+
+static int sample_laguna(
+        const float   *logits,
+        uint32_t       n_vocab,
+        float          temperature,
+        int            top_k,
+        float          top_p,
+        float          min_p,
+        uint64_t      *rng,
+        const int     *history,
+        int            history_len,
+        const uint8_t *breaker_flags,
+        int           *repeat_count) {
+    if (temperature <= 0.0f) return sample_argmax(logits, n_vocab);
+    if (top_p < 0.0f || top_p > 1.0f || !isfinite(top_p)) top_p = 1.0f;
+    if (min_p < 0.0f || isnan(min_p)) min_p = 0.0f;
+
+    uint32_t keep = top_k > 0 ? (uint32_t)top_k : n_vocab;
+    if (keep > n_vocab) keep = n_vocab;
+    sample_candidate stack_cand[LAGUNA_SAMPLE_STACK_CAP];
+    const bool owned = keep > LAGUNA_SAMPLE_STACK_CAP;
+    sample_candidate *cand = owned ?
+        xmalloc((size_t)n_vocab * sizeof(cand[0])) : stack_cand;
+    uint32_t n = 0;
+
+    if (!owned) {
+        for (uint32_t token = 0; token < n_vocab; token++) {
+            const float logit = logits[token];
+            if (!isfinite(logit)) continue;
+            if (n == keep && logit <= cand[n - 1u].logit) continue;
+            uint32_t pos = n < keep ? n++ : n - 1u;
+            while (pos > 0 && cand[pos - 1u].logit < logit) {
+                cand[pos] = cand[pos - 1u];
+                pos--;
+            }
+            cand[pos] = (sample_candidate){(int)token, logit, 0.0f};
+        }
+    } else {
+        for (uint32_t token = 0; token < n_vocab; token++) {
+            if (!isfinite(logits[token])) continue;
+            cand[n++] = (sample_candidate){(int)token, logits[token], 0.0f};
+        }
+        qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
+        if (n > keep) n = keep;
+    }
+    if (n == 0) {
+        if (owned) free(cand);
+        return sample_argmax(logits, n_vocab);
+    }
+
+    float sum = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        cand[i].prob = expf(cand[i].logit - cand[0].logit);
+        sum += cand[i].prob;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        const int token = cand[0].id;
+        if (owned) free(cand);
+        return token;
+    }
+    if (top_p < 1.0f) {
+        float cumulative = 0.0f;
+        uint32_t filtered = 0;
+        do {
+            cumulative += cand[filtered++].prob;
+        } while (filtered < n && cumulative / sum < top_p);
+        n = filtered;
+    }
+    if (min_p > 0.0f && n > 1) {
+        const float min_logit = cand[0].logit + logf(min_p);
+        uint32_t filtered = 1;
+        while (filtered < n && cand[filtered].logit >= min_logit) filtered++;
+        n = filtered;
+    }
+    if (n == 1u) {
+        const int token = cand[0].id;
+        if (owned) free(cand);
+        return token;
+    }
+
+    for (uint32_t i = 0; i < n; i++) cand[i].logit /= temperature;
+    laguna_apply_dry(cand, (int)n, history, history_len,
+                     breaker_flags, n_vocab, NULL, 0, repeat_count);
+    qsort(cand, n, sizeof(cand[0]), sample_candidate_cmp_desc);
+
+    sum = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        cand[i].prob = expf(cand[i].logit - cand[0].logit);
+        sum += cand[i].prob;
+    }
+    if (sum <= 0.0f || !isfinite(sum)) {
+        const int token = cand[0].id;
+        if (owned) free(cand);
+        return token;
+    }
+    float draw = sample_rng_f32(rng) * sum;
+    int token = cand[n - 1u].id;
+    for (uint32_t i = 0; i < n; i++) {
+        draw -= cand[i].prob;
+        if (draw <= 0.0f) {
+            token = cand[i].id;
+            break;
+        }
+    }
+    if (owned) free(cand);
+    return token;
+}
+
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
@@ -37858,6 +38137,54 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
     if (!logits || !rng || n_vocab == 0) return -1;
     return sample_top_p_min_p(logits, n_vocab, temperature, top_k,
                               top_p, min_p, rng, prob_scratch);
+}
+
+int ds4_test_apply_laguna_dry(float *logits, uint32_t n_vocab,
+                               const int *history, int history_len,
+                               const int *breakers, int n_breakers) {
+    if (!logits || n_vocab == 0 || history_len < 0 ||
+        (history_len > 0 && !history) || n_breakers < 0 ||
+        (n_breakers > 0 && !breakers)) {
+        return 0;
+    }
+    sample_candidate *cand = xmalloc((size_t)n_vocab * sizeof(cand[0]));
+    int *repeat_count = history_len > 0 ?
+        xmalloc((size_t)history_len * sizeof(repeat_count[0])) : NULL;
+    for (uint32_t i = 0; i < n_vocab; i++) {
+        cand[i] = (sample_candidate){(int)i, logits[i], 0.0f};
+    }
+    laguna_apply_dry(cand, (int)n_vocab, history, history_len, NULL, n_vocab,
+                     breakers, n_breakers, repeat_count);
+    for (uint32_t i = 0; i < n_vocab; i++) logits[cand[i].id] = cand[i].logit;
+    free(repeat_count);
+    free(cand);
+    return 1;
+}
+
+int ds4_test_sample_laguna_logits(
+        const float *logits, uint32_t n_vocab,
+        float temperature, int top_k, float top_p, float min_p,
+        const int *history, int history_len,
+        const int *breakers, int n_breakers, uint64_t *rng) {
+    if (!logits || n_vocab == 0 || !rng || history_len < 0 ||
+        (history_len > 0 && !history) || n_breakers < 0 ||
+        (n_breakers > 0 && !breakers)) {
+        return -1;
+    }
+    uint8_t *breaker_flags = xcalloc(n_vocab, sizeof(breaker_flags[0]));
+    for (int i = 0; i < n_breakers; i++) {
+        if (breakers[i] >= 0 && (uint32_t)breakers[i] < n_vocab) {
+            breaker_flags[breakers[i]] = 1;
+        }
+    }
+    int *repeat_count = history_len > 0 ?
+        xmalloc((size_t)history_len * sizeof(repeat_count[0])) : NULL;
+    const int token = sample_laguna(
+        logits, n_vocab, temperature, top_k, top_p, min_p, rng,
+        history, history_len, breaker_flags, repeat_count);
+    free(repeat_count);
+    free(breaker_flags);
+    return token;
 }
 #endif
 
@@ -50141,6 +50468,8 @@ struct ds4_session {
     token_vec greedy_splitkv_segment;
     float *logits;
     float *sample_probs;
+    int *dry_repeat_count;
+    int dry_repeat_cap;
     float *mtp_logits;
     int greedy_splitkv_anchor_len;
 #ifndef DS4_NO_GPU
@@ -58379,6 +58708,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
         vocab_load(&e->vocab, &e->model);
+        laguna_dry_init_breakers(e);
     } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (opt->inspect_only) {
             *out = e;
@@ -59412,6 +59742,7 @@ void ds4_engine_close(ds4_engine *e) {
 #endif
     ds4_expert_profile_close();
     weights_free(&e->weights);
+    free(e->laguna_dry_breaker);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
@@ -59922,6 +60253,7 @@ void ds4_session_free(ds4_session *s) {
     token_vec_free(&s->greedy_splitkv_segment);
     free(s->logits);
     free(s->sample_probs);
+    free(s->dry_repeat_count);
 #ifndef DS4_NO_GPU
     free(s->glm_mtp_hc);
     free(s->glm_mtp_logits0);
@@ -61926,6 +62258,27 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    if (ds4_session_is_laguna(s)) {
+        const int history_len = s->checkpoint_valid ? s->checkpoint.len : 0;
+        if (history_len > s->dry_repeat_cap) {
+            int new_cap = s->dry_repeat_cap > 0 ? s->dry_repeat_cap : 256;
+            while (new_cap < history_len) {
+                if (new_cap > INT_MAX / 2) {
+                    new_cap = history_len;
+                    break;
+                }
+                new_cap *= 2;
+            }
+            s->dry_repeat_count = xrealloc(
+                s->dry_repeat_count,
+                (size_t)new_cap * sizeof(s->dry_repeat_count[0]));
+            s->dry_repeat_cap = new_cap;
+        }
+        return sample_laguna(s->logits, DS4_N_VOCAB, temperature, top_k,
+                             top_p, min_p, rng, s->checkpoint.v, history_len,
+                             s->engine->laguna_dry_breaker,
+                             s->dry_repeat_count);
+    }
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
