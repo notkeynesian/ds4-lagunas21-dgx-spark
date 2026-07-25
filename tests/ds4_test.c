@@ -6615,6 +6615,8 @@ static void test_think_tool_recovery(void) {
     memset(&srv, 0, sizeof(srv));
     srv.engine = engine;
     srv.session = session;
+    server_slot slot = {.session = session};
+    pthread_mutex_init(&srv.inference_mu, NULL);
 
     /* Replay the malformed prefix exactly as the worker loop would see it:
      * token by token, running the recovery scan after each piece.  The stanza
@@ -6637,7 +6639,7 @@ static void test_think_tool_recovery(void) {
         thinking_state_feed(&thinking, piece, piece_len);
         free(piece);
         TEST_ASSERT(thinking.inside);
-        rec = chat_think_tool_recovery(&srv, &text, &thinking, &scan_from,
+        rec = chat_think_tool_recovery(&srv, &slot, &text, &thinking, &scan_from,
                                        &completion, 512, err, sizeof(err));
         TEST_ASSERT(rec >= 0);
         if (rec == 1) {
@@ -6680,6 +6682,7 @@ static void test_think_tool_recovery(void) {
             text.ptr ? text.ptr : "");
     TEST_ASSERT(decode_ok);
     TEST_ASSERT(saw_end);
+    pthread_mutex_destroy(&srv.inference_mu);
 
     char *content = NULL;
     char *reasoning = NULL;

@@ -261,6 +261,11 @@ The DRY repetition algorithm and breaker semantics are derived from
 [`llama.cpp`](https://github.com/ggml-org/llama.cpp) and its community recipe;
 Laguna retains this chain while emitting native tool stanzas so DRY can break
 structural loops. Other model families retain their existing sampling behavior.
+The server also closes an unbounded Laguna reasoning block after 512 generated
+thinking tokens, leaving at least half of short completion budgets for the reply.
+Set `DS4_SERVER_LAGUNA_THINK_BUDGET` to another non-negative token count; `0`
+disables the cap. The forced `</think>` is evaluated into the model session so
+the streamed response, token history, and KV state remain consistent.
 
 Then build:
 

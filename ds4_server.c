@@ -10286,6 +10286,80 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+#define SERVER_LAGUNA_THINK_BUDGET_DEFAULT 512
+#define SERVER_LAGUNA_REPLY_RESERVE 512
+
+static int parse_laguna_think_budget(const char *env) {
+    if (!env || !env[0]) return SERVER_LAGUNA_THINK_BUDGET_DEFAULT;
+    char *end = NULL;
+    long value = strtol(env, &end, 10);
+    if (end == env || *end != '\0' || value < 0 || value > INT_MAX) {
+        return SERVER_LAGUNA_THINK_BUDGET_DEFAULT;
+    }
+    return (int)value;
+}
+
+static int effective_laguna_think_budget(int configured, int max_tokens,
+                                         int close_tokens) {
+    if (configured <= 0 || max_tokens <= 0) return -1;
+    int reserve = max_tokens / 2;
+    if (reserve > SERVER_LAGUNA_REPLY_RESERVE) reserve = SERVER_LAGUNA_REPLY_RESERVE;
+    int available = max_tokens - reserve - close_tokens;
+    if (available <= 0) return 0;
+    return configured < available ? configured : available;
+}
+
+static int server_laguna_think_budget(ds4_engine *engine, int max_tokens) {
+    ds4_tokens close = {0};
+    ds4_tokenize_rendered_chat(engine, "</think>\n\n", &close);
+    int budget = effective_laguna_think_budget(
+        parse_laguna_think_budget(getenv("DS4_SERVER_LAGUNA_THINK_BUDGET")),
+        max_tokens, close.len);
+    ds4_tokens_free(&close);
+    return budget;
+}
+
+static int server_eval_token(server *s, server_slot *slot, int token,
+                             char *err, size_t errlen);
+
+/* Force text through the normal tokenizer and evaluator so the visible output,
+ * token history, and KV state all agree. Returns 1 when injected, 0 when there
+ * is insufficient generation/context room, and -1 on evaluation failure. */
+static int chat_force_think_close(server *s,
+                                  server_slot *slot,
+                                  buf *text,
+                                  thinking_state *thinking,
+                                  int *completion,
+                                  int max_tokens,
+                                  char *err,
+                                  size_t errlen) {
+    if (!thinking->inside) return 0;
+
+    const char *inject = "</think>\n\n";
+    const size_t inject_len = strlen(inject);
+    ds4_tokens toks = {0};
+    ds4_tokenize_rendered_chat(s->engine, inject, &toks);
+
+    const int room = ds4_session_ctx(slot->session) - ds4_session_pos(slot->session);
+    if (toks.len <= 0 || toks.len >= room ||
+        *completion + toks.len >= max_tokens) {
+        ds4_tokens_free(&toks);
+        return 0;
+    }
+
+    for (int i = 0; i < toks.len; i++) {
+        if (server_eval_token(s, slot, toks.v[i], err, errlen) != 0) {
+            ds4_tokens_free(&toks);
+            return -1;
+        }
+        (*completion)++;
+    }
+    buf_append(text, inject, inject_len);
+    thinking_state_feed(thinking, inject, inject_len);
+    ds4_tokens_free(&toks);
+    return 1;
+}
+
 /* Live recovery for a tool call started inside an unclosed <think> block.
  *
  * The model sometimes opens a DSML stanza without closing its thinking first.
@@ -10310,6 +10384,7 @@ static thinking_state thinking_state_from_prompt(const request *r) {
  * Returns 1 when an injection was performed (text extended, thinking closed),
  * 0 when there is nothing to do or no budget, -1 on eval failure. */
 static int chat_think_tool_recovery(server *s,
+                                    server_slot *slot,
                                     buf *text,
                                     thinking_state *thinking,
                                     size_t *scan_from,
@@ -10325,34 +10400,18 @@ static int chat_think_tool_recovery(server *s,
         return 0;
     }
 
-    const char *inject = "</think>\n\n";
-    const size_t inject_len = strlen(inject);
-    ds4_tokens toks = {0};
-    ds4_tokenize_rendered_chat(s->engine, inject, &toks);
-
-    const int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
-    if (toks.len <= 0 ||
-        toks.len >= room ||
-        *completion + toks.len >= max_tokens) {
+    const int injected = chat_force_think_close(s, slot, text, thinking,
+                                                 completion, max_tokens,
+                                                 err, errlen);
+    if (injected == 0) {
         /* Not enough budget to recover; leave the stream as generated and let
          * the parse-time fallback deal with it.  Skip past this marker so the
          * scan does not retry it every token. */
-        ds4_tokens_free(&toks);
         *scan_from = text->len;
         return 0;
     }
-
-    for (int i = 0; i < toks.len; i++) {
-        if (ds4_session_eval(s->session, toks.v[i], err, errlen) != 0) {
-            ds4_tokens_free(&toks);
-            return -1;
-        }
-        (*completion)++;
-    }
-    buf_append(text, inject, inject_len);
-    thinking_state_feed(thinking, inject, inject_len);
+    if (injected < 0) return -1;
     *scan_from = text->len;
-    ds4_tokens_free(&toks);
     return 1;
 }
 
@@ -11622,6 +11681,11 @@ decode_again:
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
+    int thinking_tokens = 0;
+    const int thinking_budget =
+        j->req.kind == REQ_CHAT && ds4_engine_is_laguna(s->engine) &&
+        ds4_think_mode_enabled(j->req.think_mode) ?
+        server_laguna_think_budget(s->engine, max_tokens) : -1;
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -11634,6 +11698,32 @@ decode_again:
     server_generation_enter(s);
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
+        if (thinking.inside && thinking_budget >= 0 &&
+            thinking_tokens >= thinking_budget) {
+            const int injected = chat_force_think_close(s, slot, &text, &thinking,
+                                                         &completion, max_tokens,
+                                                         err, sizeof(err));
+            if (injected < 0) {
+                finish = "error";
+                break;
+            }
+            if (injected > 0) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s forced </think> at Laguna reasoning budget=%d after %d generated tokens",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           thinking_budget,
+                           completion);
+                trace_event(s, trace_id,
+                            "forced </think> at Laguna reasoning budget=%d after %d generated tokens",
+                            thinking_budget, completion);
+                if (j->req.has_tools) {
+                    dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
+                    tool_scan_waiting_for_think_close = true;
+                }
+            }
+        }
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -11675,13 +11765,20 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
+        int speculative_limit = max_tokens - completion;
+        if (thinking.inside && thinking_budget > thinking_tokens) {
+            int remaining_thinking = thinking_budget - thinking_tokens;
+            if (speculative_limit > remaining_thinking) {
+                speculative_limit = remaining_thinking;
+            }
+        }
         if (!s->batched_mode && temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_argmax(slot->session,
                                                        token,
-                                                       max_tokens - completion,
+                                                       speculative_limit,
                                                        ds4_token_eos(s->engine),
                                                        j->req.think_mode,
                                                        toks,
@@ -11718,7 +11815,9 @@ decode_again:
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
+            const bool was_thinking = thinking.inside;
             thinking_state_feed(&thinking, piece, piece_len);
+            if (was_thinking) thinking_tokens++;
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
             }
@@ -11792,7 +11891,7 @@ decode_again:
                      * close so the model restarts the call on the executable
                      * side. */
                     const int recovered = think_tool_recovery_enabled ?
-                        chat_think_tool_recovery(s, &text, &thinking,
+                        chat_think_tool_recovery(s, slot, &text, &thinking,
                                                  &think_recovery_scan_from,
                                                  &completion, max_tokens,
                                                  err, sizeof(err)) : 0;
@@ -16716,6 +16815,21 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
+static void test_laguna_think_budget_preserves_reply_room(void) {
+    TEST_ASSERT(parse_laguna_think_budget(NULL) == 512);
+    TEST_ASSERT(parse_laguna_think_budget("") == 512);
+    TEST_ASSERT(parse_laguna_think_budget("0") == 0);
+    TEST_ASSERT(parse_laguna_think_budget("256") == 256);
+    TEST_ASSERT(parse_laguna_think_budget("-1") == 512);
+    TEST_ASSERT(parse_laguna_think_budget("invalid") == 512);
+
+    TEST_ASSERT(effective_laguna_think_budget(512, 8192, 2) == 512);
+    TEST_ASSERT(effective_laguna_think_budget(512, 512, 2) == 254);
+    TEST_ASSERT(effective_laguna_think_budget(512, 128, 2) == 62);
+    TEST_ASSERT(effective_laguna_think_budget(512, 4, 2) == 0);
+    TEST_ASSERT(effective_laguna_think_budget(0, 8192, 2) == -1);
+}
+
 static void test_thinking_checkpoint_remember_gate(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -17900,6 +18014,7 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
+    test_laguna_think_budget_preserves_reply_room();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();
