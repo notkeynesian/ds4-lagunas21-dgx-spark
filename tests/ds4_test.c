@@ -6828,13 +6828,16 @@ static bool test_mtp_worst_argmax_gap(ds4_engine *engine, const ds4_tokens *prom
     TEST_ASSERT(ok);
 
     for (int i = 0; ok && i < n; i++) {
-        ds4_token_score best, cur;
-        ok = ds4_session_top_logprobs(session, &best, 1) >= 1 &&
+        ds4_token_score top[3], cur;
+        ok = ds4_session_top_logprobs(session, top, 3) >= 3 &&
              ds4_session_token_logprob(session, toks[i], &cur) == 1;
+        for (int rank = 0; ok && rank < 3; rank++) {
+            ok = ds4_session_token_rank(session, top[rank].id, 3) == rank + 1;
+        }
         TEST_ASSERT(ok);
         if (!ok) break;
 
-        const float gap = best.logit - cur.logit;
+        const float gap = top[0].logit - cur.logit;
         if (gap > *worst_gap) { *worst_gap = gap; *worst_at = i; }
         if (ds4_session_eval(session, toks[i], err, sizeof(err)) != 0) { ok = false; TEST_ASSERT(false); break; }
     }

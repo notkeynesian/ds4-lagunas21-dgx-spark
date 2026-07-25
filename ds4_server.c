@@ -10286,37 +10286,26 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
-#define SERVER_LAGUNA_THINK_BUDGET_DEFAULT 512
-#define SERVER_LAGUNA_REPLY_RESERVE 512
+#define SERVER_LAGUNA_THINK_CLOSE_RANK_DEFAULT 3
+#define SERVER_LAGUNA_THINK_CLOSE_RANK_MAX 64
 
-static int parse_laguna_think_budget(const char *env) {
-    if (!env || !env[0]) return SERVER_LAGUNA_THINK_BUDGET_DEFAULT;
+static int parse_laguna_think_close_rank(const char *env) {
+    if (!env || !env[0]) return SERVER_LAGUNA_THINK_CLOSE_RANK_DEFAULT;
     char *end = NULL;
     long value = strtol(env, &end, 10);
-    if (end == env || *end != '\0' || value < 0 || value > INT_MAX) {
-        return SERVER_LAGUNA_THINK_BUDGET_DEFAULT;
+    if (end == env || *end != '\0' || value < 0 ||
+        value > SERVER_LAGUNA_THINK_CLOSE_RANK_MAX) {
+        return SERVER_LAGUNA_THINK_CLOSE_RANK_DEFAULT;
     }
     return (int)value;
 }
 
-static int effective_laguna_think_budget(int configured, int max_tokens,
-                                         int close_tokens) {
-    if (configured <= 0 || max_tokens <= 0) return -1;
-    int reserve = max_tokens / 2;
-    if (reserve > SERVER_LAGUNA_REPLY_RESERVE) reserve = SERVER_LAGUNA_REPLY_RESERVE;
-    int available = max_tokens - reserve - close_tokens;
-    if (available <= 0) return 0;
-    return configured < available ? configured : available;
-}
-
-static int server_laguna_think_budget(ds4_engine *engine, int max_tokens) {
+static int laguna_think_close_token(ds4_engine *engine) {
     ds4_tokens close = {0};
-    ds4_tokenize_rendered_chat(engine, "</think>\n\n", &close);
-    int budget = effective_laguna_think_budget(
-        parse_laguna_think_budget(getenv("DS4_SERVER_LAGUNA_THINK_BUDGET")),
-        max_tokens, close.len);
+    ds4_tokenize_rendered_chat(engine, "</think>", &close);
+    int token = close.len == 1 ? close.v[0] : -1;
     ds4_tokens_free(&close);
-    return budget;
+    return token;
 }
 
 static int server_eval_token(server *s, server_slot *slot, int token,
@@ -11681,11 +11670,13 @@ decode_again:
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
-    int thinking_tokens = 0;
-    const int thinking_budget =
+    const int think_close_rank_limit =
         j->req.kind == REQ_CHAT && ds4_engine_is_laguna(s->engine) &&
         ds4_think_mode_enabled(j->req.think_mode) ?
-        server_laguna_think_budget(s->engine, max_tokens) : -1;
+        parse_laguna_think_close_rank(
+            getenv("DS4_SERVER_LAGUNA_THINK_CLOSE_RANK")) : 0;
+    const int think_close_token = think_close_rank_limit > 0 ?
+        laguna_think_close_token(s->engine) : -1;
     const bool thinking_gates_tool_markers = ds4_think_mode_enabled(j->req.think_mode);
     bool tool_scan_waiting_for_think_close =
         thinking_gates_tool_markers && thinking.inside;
@@ -11698,32 +11689,6 @@ decode_again:
     server_generation_enter(s);
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
-        if (thinking.inside && thinking_budget >= 0 &&
-            thinking_tokens >= thinking_budget) {
-            const int injected = chat_force_think_close(s, slot, &text, &thinking,
-                                                         &completion, max_tokens,
-                                                         err, sizeof(err));
-            if (injected < 0) {
-                finish = "error";
-                break;
-            }
-            if (injected > 0) {
-                server_log(DS4_LOG_WARNING,
-                           "ds4-server: chat ctx=%s%s%s forced </think> at Laguna reasoning budget=%d after %d generated tokens",
-                           ctx_span,
-                           req_flags[0] ? " " : "",
-                           req_flags,
-                           thinking_budget,
-                           completion);
-                trace_event(s, trace_id,
-                            "forced </think> at Laguna reasoning budget=%d after %d generated tokens",
-                            thinking_budget, completion);
-                if (j->req.has_tools) {
-                    dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
-                    tool_scan_waiting_for_think_close = true;
-                }
-            }
-        }
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -11754,8 +11719,24 @@ decode_again:
             !ds4_engine_is_laguna(s->engine)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(slot->session, temperature, top_k,
-                                       top_p, min_p, &rng);
+        int selected_close_rank = thinking.inside ?
+            ds4_session_token_rank(slot->session, think_close_token,
+                                   think_close_rank_limit) : 0;
+        int token = selected_close_rank > 0 ? think_close_token :
+            ds4_session_sample(slot->session, temperature, top_k,
+                               top_p, min_p, &rng);
+        if (selected_close_rank > 0) {
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: chat ctx=%s%s%s selected </think> at model rank=%d after %d generated tokens",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags,
+                       selected_close_rank,
+                       completion);
+            trace_event(s, trace_id,
+                        "selected </think> at model rank=%d after %d generated tokens",
+                        selected_close_rank, completion);
+        }
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
@@ -11765,20 +11746,15 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        int speculative_limit = max_tokens - completion;
-        if (thinking.inside && thinking_budget > thinking_tokens) {
-            int remaining_thinking = thinking_budget - thinking_tokens;
-            if (speculative_limit > remaining_thinking) {
-                speculative_limit = remaining_thinking;
-            }
-        }
-        if (!s->batched_mode && temperature <= 0.0f &&
+        if (selected_close_rank == 0 &&
+            (!thinking.inside || think_close_rank_limit == 0) &&
+            !s->batched_mode && temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_argmax(slot->session,
                                                        token,
-                                                       speculative_limit,
+                                                       max_tokens - completion,
                                                        ds4_token_eos(s->engine),
                                                        j->req.think_mode,
                                                        toks,
@@ -11815,9 +11791,7 @@ decode_again:
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
-            const bool was_thinking = thinking.inside;
             thinking_state_feed(&thinking, piece, piece_len);
-            if (was_thinking) thinking_tokens++;
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
             }
@@ -16815,19 +16789,17 @@ static void test_thinking_state_tracks_prompt_and_generated_tags(void) {
     request_free(&r);
 }
 
-static void test_laguna_think_budget_preserves_reply_room(void) {
-    TEST_ASSERT(parse_laguna_think_budget(NULL) == 512);
-    TEST_ASSERT(parse_laguna_think_budget("") == 512);
-    TEST_ASSERT(parse_laguna_think_budget("0") == 0);
-    TEST_ASSERT(parse_laguna_think_budget("256") == 256);
-    TEST_ASSERT(parse_laguna_think_budget("-1") == 512);
-    TEST_ASSERT(parse_laguna_think_budget("invalid") == 512);
+static void test_laguna_think_close_uses_model_rank(void) {
+    TEST_ASSERT(parse_laguna_think_close_rank(NULL) == 3);
+    TEST_ASSERT(parse_laguna_think_close_rank("") == 3);
+    TEST_ASSERT(parse_laguna_think_close_rank("0") == 0);
+    TEST_ASSERT(parse_laguna_think_close_rank("2") == 2);
+    TEST_ASSERT(parse_laguna_think_close_rank("3") == 3);
+    TEST_ASSERT(parse_laguna_think_close_rank("64") == 64);
+    TEST_ASSERT(parse_laguna_think_close_rank("65") == 3);
+    TEST_ASSERT(parse_laguna_think_close_rank("-1") == 3);
+    TEST_ASSERT(parse_laguna_think_close_rank("invalid") == 3);
 
-    TEST_ASSERT(effective_laguna_think_budget(512, 8192, 2) == 512);
-    TEST_ASSERT(effective_laguna_think_budget(512, 512, 2) == 254);
-    TEST_ASSERT(effective_laguna_think_budget(512, 128, 2) == 62);
-    TEST_ASSERT(effective_laguna_think_budget(512, 4, 2) == 0);
-    TEST_ASSERT(effective_laguna_think_budget(0, 8192, 2) == -1);
 }
 
 static void test_thinking_checkpoint_remember_gate(void) {
@@ -18014,7 +17986,7 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
-    test_laguna_think_budget_preserves_reply_room();
+    test_laguna_think_close_uses_model_rank();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
     test_canonical_rewrite_rebuilds_when_live_tail_changes();

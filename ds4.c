@@ -62342,6 +62342,23 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     return 1;
 }
 
+int ds4_session_token_rank(ds4_session *s, int token, int max_rank) {
+    if (!s || !s->logits || token < 0 || token >= (int)DS4_N_VOCAB ||
+        max_rank <= 0) return 0;
+    const float target = s->logits[token];
+    if (!isfinite(target)) return 0;
+
+    int rank = 1;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if ((int)i == token || !isfinite(s->logits[i])) continue;
+        if (s->logits[i] > target ||
+            (s->logits[i] == target && (int)i < token)) {
+            if (++rank > max_rank) return 0;
+        }
+    }
+    return rank;
+}
+
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));

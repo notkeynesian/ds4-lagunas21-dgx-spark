@@ -387,6 +387,8 @@ uint64_t ds4_test_mixed_native_count(void);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
+/* Return the token's one-based raw-logit rank when it is <= max_rank, else 0. */
+int ds4_session_token_rank(ds4_session *s, int token, int max_rank);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 /* Pay the one-time first-submission GPU cost outside any measured window;
