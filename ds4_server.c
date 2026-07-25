@@ -2686,7 +2686,41 @@ static char *render_laguna_chat_prompt_text(const chat_msgs *msgs,
                      "<available_tools>\n");
             buf_puts(&out, tool_schemas);
             if (out.len && out.ptr[out.len - 1] != '\n') buf_putc(&out, '\n');
-            buf_puts(&out, "</available_tools>");
+            /* Adapted from sanjxz's MIT-licensed Laguna v24 loop-guard
+             * template. The native tags alone do not tell the model when to
+             * stop deliberating and move to a concrete tool action. */
+            buf_puts(&out,
+                     "</available_tools>\n\n"
+                     "If you choose to call a function, reply only with the "
+                     "following format and no suffix:\n\n"
+                     "<tool_call>function_name<arg_key>parameter_1</arg_key>"
+                     "<arg_value>value_1</arg_value></tool_call>\n\n"
+                     "<IMPORTANT>\n");
+            if (think) {
+                buf_puts(&out,
+                         "- Use the <think></think> block only to plan the next "
+                         "tool call or formulate the final response.\n"
+                         "- Put all reasoning inside <think></think>.\n"
+                         "- Put each tool call immediately after </think>, with "
+                         "no conversational text before it.\n");
+            } else {
+                buf_puts(&out,
+                         "- Put each tool call at the start of the response, "
+                         "with no conversational text before it.\n");
+            }
+            buf_puts(&out,
+                     "- Emit one complete <tool_call></tool_call> block per "
+                     "function call.\n"
+                     "- Take required argument values from the user request, "
+                     "visible repository state, the tool schema, or a previous "
+                     "tool result. Inspect first when a value is unknown.\n"
+                     "- Keep working until the request is complete. Prefer "
+                     "small concrete actions over long deliberation.\n"
+                     "- After making a change, verify it before continuing.\n"
+                     "- Stop when the task is complete, blocked, or requires "
+                     "user input.\n"
+                     "- If no tool is needed, answer the user directly.\n"
+                     "</IMPORTANT>");
         }
         buf_puts(&out, "</system>\n");
     }
@@ -14986,7 +15020,11 @@ static void test_render_laguna_tools_and_reasoning(void) {
     TEST_ASSERT(strstr(prompt,
         "<system>Code carefully.\n\n### Tools\n\n") != NULL);
     TEST_ASSERT(strstr(prompt, "<available_tools>\n") != NULL);
-    TEST_ASSERT(strstr(prompt, "</available_tools></system>\n") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "</available_tools>\n\nIf you choose to call a function") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "Prefer small concrete actions over long deliberation.") != NULL);
+    TEST_ASSERT(strstr(prompt, "</IMPORTANT></system>\n") != NULL);
     TEST_ASSERT(strstr(prompt,
         "<assistant><think>Use the shell.</think>"
         "<tool_call>bash<arg_key>command</arg_key>"

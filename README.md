@@ -196,6 +196,12 @@ tagged tool-call formats:
   --cuda -c 32768 -p "Explain this repository"
 ```
 
+The server's Laguna tool prompt includes agentic anti-loop guidance adapted
+from sanjxz's MIT-licensed `laguna-s21-froggeric-v24.0-loopguard` template.
+It preserves Laguna's native tags while directing the model to prefer concrete
+tool actions over extended deliberation. DwarfStar does not execute the Jinja
+template embedded in the GGUF; its server renderer is implemented in C.
+
 CUDA also supports Poolside's official BF16 DFlash drafter with either the Q4
 or mixed Q2_K/Q3_K target. The DFlash GGUF
 captures six target-layer residual streams, fuses them into a six-layer
