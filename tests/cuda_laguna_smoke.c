@@ -642,85 +642,6 @@ static int check_q8_qkvg(model_blob *blob,
     return 0;
 }
 
-static int check_q8_decode_rows_exact(model_blob *blob,
-                                      uint64_t q_offset,
-                                      uint64_t k_offset) {
-    enum {
-        n_rows = 2,
-        in_dim = QK_K,
-        q_dim = 33,
-        k_dim = 17,
-    };
-    float input[n_rows * in_dim];
-    float q_ref[n_rows * q_dim], k_ref[n_rows * k_dim];
-    float q_got[n_rows * q_dim], k_got[n_rows * k_dim];
-    for (uint32_t r = 0; r < n_rows; r++) {
-        for (uint32_t i = 0; i < in_dim; i++) {
-            input[r * in_dim + i] =
-                ((int32_t)((i * 11u + r * 17u) % 41u) - 20) * 0.0234375f;
-        }
-    }
-
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(input));
-    ds4_gpu_tensor *q0 = ds4_gpu_tensor_alloc(sizeof(q_ref));
-    ds4_gpu_tensor *k0 = ds4_gpu_tensor_alloc(sizeof(k_ref));
-    ds4_gpu_tensor *q1 = ds4_gpu_tensor_alloc(sizeof(q_got));
-    ds4_gpu_tensor *k1 = ds4_gpu_tensor_alloc(sizeof(k_got));
-    CHECK(x && q0 && k0 && q1 && k1,
-          "exact Q8 decode rows tensor allocation");
-    CHECK(ds4_gpu_tensor_write(x, 0, input, sizeof(input)),
-          "write exact Q8 decode rows input");
-
-    for (uint32_t r = 0; r < n_rows; r++) {
-        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(
-            x, (uint64_t)r * in_dim * sizeof(float),
-            (uint64_t)in_dim * sizeof(float));
-        ds4_gpu_tensor *qr = ds4_gpu_tensor_view(
-            q0, (uint64_t)r * q_dim * sizeof(float),
-            (uint64_t)q_dim * sizeof(float));
-        ds4_gpu_tensor *kr = ds4_gpu_tensor_view(
-            k0, (uint64_t)r * k_dim * sizeof(float),
-            (uint64_t)k_dim * sizeof(float));
-        CHECK(xr && qr && kr, "exact Q8 decode row views");
-        CHECK(ds4_gpu_matmul_q8_0_pair_tensor(
-                  qr, kr, blob->data, blob->size, q_offset, k_offset,
-                  in_dim, q_dim, k_dim, xr, 1u),
-              "reference one-row Q8 decode projection");
-        ds4_gpu_tensor_free(kr);
-        ds4_gpu_tensor_free(qr);
-        ds4_gpu_tensor_free(xr);
-    }
-    CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
-              q1, blob->data, blob->size, q_offset,
-              in_dim, q_dim, x, n_rows),
-          "two-row exact single Q8 decode projection");
-    CHECK(ds4_gpu_tensor_read(q0, 0, q_ref, sizeof(q_ref)) &&
-          ds4_gpu_tensor_read(q1, 0, q_got, sizeof(q_got)),
-          "read exact single Q8 decode rows output");
-    CHECK(memcmp(q_got, q_ref, sizeof(q_ref)) == 0,
-          "two-row exact single Q8 projection");
-    CHECK(ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
-              q1, k1, blob->data, blob->size, q_offset, k_offset,
-              in_dim, q_dim, k_dim, x, n_rows),
-          "two-row exact Q8 decode projection");
-    CHECK(ds4_gpu_tensor_read(q0, 0, q_ref, sizeof(q_ref)) &&
-          ds4_gpu_tensor_read(k0, 0, k_ref, sizeof(k_ref)) &&
-          ds4_gpu_tensor_read(q1, 0, q_got, sizeof(q_got)) &&
-          ds4_gpu_tensor_read(k1, 0, k_got, sizeof(k_got)),
-          "read exact Q8 decode rows outputs");
-    CHECK(memcmp(q_got, q_ref, sizeof(q_ref)) == 0,
-          "two-row exact Q8 Q projection");
-    CHECK(memcmp(k_got, k_ref, sizeof(k_ref)) == 0,
-          "two-row exact Q8 K projection");
-
-    ds4_gpu_tensor_free(k1);
-    ds4_gpu_tensor_free(q1);
-    ds4_gpu_tensor_free(k0);
-    ds4_gpu_tensor_free(q0);
-    ds4_gpu_tensor_free(x);
-    return 0;
-}
-
 static float softplus(float x) {
     return x > 20.0f ? x : log1pf(expf(x));
 }
@@ -1756,9 +1677,6 @@ int main(void) {
     if (rc == 0) {
         rc = check_q8_qkvg(
                 &blob, q8_q_offset, q8_k_offset, q8_v_offset, q8_gate_offset);
-    }
-    if (rc == 0) {
-        rc = check_q8_decode_rows_exact(&blob, q8_q_offset, q8_k_offset);
     }
     if (rc == 0) rc = check_norm_rope(&blob, norm_offset);
     if (rc == 0) rc = check_attention();

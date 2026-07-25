@@ -209,26 +209,15 @@ so accepted tokens and KV state remain serial-target equivalent:
   --mtp gguf/laguna-s-2.1-DFlash-BF16.gguf --mtp-draft 15 --temp 0
 ```
 
-`--mtp-draft` defaults to 15 for this drafter. By default, exact verification is
-the correctness reference and may not improve throughput yet because accepted
-rows are evaluated with the serial target kernels. `DS4_DFLASH_APPROX_VERIFY=1`
+`--mtp-draft` defaults to 15 for this drafter. Exact verification is the
+correctness reference and may not improve throughput yet because accepted rows
+are evaluated with the serial target kernels. `DS4_DFLASH_APPROX_VERIFY=1`
 restores the experimental batched verifier, whose multi-row CUDA arithmetic can
 produce a different greedy continuation than serial target decode. In that
 mode, the adaptive scheduler starts at depth four, backs off when verified cost
 per committed token is worse, and grows after repeated full, profitable
 accepts; `DS4_DFLASH_ADAPTIVE=0` uses the fixed requested depth. DFlash needs
 roughly another 2.1 GiB for weights plus its graph buffers.
-
-`DS4_DFLASH_EXACT_DECODE2=1` opts CUDA into an experimental layer-major
-two-row exact verifier for revised Q8 signal-path Laguna targets. It keeps
-one-token arithmetic for attention, routing, routed MoE, norms, RoPE, and
-residuals, and falls back to serial exact verification on unsupported layouts
-or any pair failure. Target logits, acceptance, and committed target KV remain
-serial-equivalent. The drafter's private KV receives both captured rows at once,
-so later proposals need not match serial injection; proposals remain subject to
-exact target verification. Default behavior is unchanged; Spark validation
-should compare continuations and logits against the serial exact path before
-using it for performance measurements.
 
 On Blackwell GPUs, DFlash also groups its nine query heads per KV head into one
 attention block so each sliding-window K/V row is loaded once per group.
