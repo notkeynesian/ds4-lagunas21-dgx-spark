@@ -268,6 +268,10 @@ Set `DS4_SERVER_LAGUNA_THINK_CLOSE_RANK` to `1`-`64` to change the threshold;
 `0` disables soft closure. Separately, if Laguna explicitly starts a tool stanza
 inside reasoning, the existing protocol repair closes thinking so that requested
 tool call can execute; that repair is triggered by model output, never by length.
+For large single-file coding tasks, the server's Laguna prompt uses a compact
+skeleton followed by bounded calls to available incremental file-update tools
+instead of one response-sized write argument. This keeps every tool stanza
+complete and independently executable.
 
 Then build:
 

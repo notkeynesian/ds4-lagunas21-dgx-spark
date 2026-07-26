@@ -2945,6 +2945,10 @@ static char *render_laguna_chat_prompt_text(const chat_msgs *msgs,
                                             ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tools = tool_schemas && tool_schemas[0];
+    const bool file_write_tool = tool_orders &&
+        (tool_schema_orders_find(tool_orders, "write") ||
+         tool_schema_orders_find(tool_orders, "write_file") ||
+         tool_schema_orders_find(tool_orders, "create_file"));
     const char *system =
         "You are a helpful, conversationally-fluent assistant made by Poolside. "
         "You are here to be helpful to users through natural language conversations.";
@@ -2999,7 +3003,20 @@ static char *render_laguna_chat_prompt_text(const chat_msgs *msgs,
                      "visible repository state, the tool schema, or a previous "
                      "tool result. Inspect first when a value is unknown.\n"
                      "- Keep working until the request is complete. Prefer "
-                     "small concrete actions over long deliberation.\n"
+                     "small concrete actions over long deliberation.\n");
+            if (file_write_tool) {
+                buf_puts(&out,
+                     "- A single-file deliverable does not require one giant "
+                     "write call. Never place more than roughly 12000 characters "
+                     "or 3000 tokens in one file-content argument.\n"
+                     "- For a large file, first write a compact skeleton with "
+                     "unique placeholders, then use separate available edit, "
+                     "patch, append, or shell calls to replace one placeholder "
+                     "at a time. If no incremental update tool is available, "
+                     "report that limitation instead of emitting an incomplete "
+                     "tool call. Always close each tool call before continuing.\n");
+            }
+            buf_puts(&out,
                      "- After making a change, verify it before continuing.\n"
                      "- Stop when the task is complete, blocked, or requires "
                      "user input.\n"
@@ -15608,6 +15625,8 @@ static void test_render_laguna_tools_and_reasoning(void) {
         "</available_tools>\n\nIf you choose to call a function") != NULL);
     TEST_ASSERT(strstr(prompt,
         "Prefer small concrete actions over long deliberation.") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "A single-file deliverable does not require one giant write call.") == NULL);
     TEST_ASSERT(strstr(prompt, "</IMPORTANT></system>\n") != NULL);
     TEST_ASSERT(strstr(prompt,
         "<assistant><think>Use the shell.</think>"
@@ -15615,6 +15634,25 @@ static void test_render_laguna_tools_and_reasoning(void) {
         "<arg_value>pwd</arg_value></tool_call></assistant>\n") != NULL);
     TEST_ASSERT(strstr(prompt,
         "<tool_response>/tmp</tool_response>\n<assistant><think>") != NULL);
+    free(prompt);
+
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"write\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{}}}");
+    const char *file_schema =
+        "{\"type\":\"function\",\"function\":{\"name\":\"write\"}}";
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_LAGUNA, &msgs, file_schema, &orders,
+        DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "A single-file deliverable does not require one giant write call.") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "roughly 12000 characters or 3000 tokens in one file-content argument") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "compact skeleton with unique placeholders") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "available edit, patch, append, or shell calls") != NULL);
 
     free(prompt);
     tool_schema_orders_free(&orders);
