@@ -552,6 +552,17 @@ typedef struct {
     int missing_ids;
 } tool_replay_stats;
 
+typedef enum {
+    TOOL_PROP_UNKNOWN,
+    TOOL_PROP_STRING,
+    TOOL_PROP_ARRAY,
+    TOOL_PROP_OBJECT,
+    TOOL_PROP_NUMBER,
+    TOOL_PROP_INTEGER,
+    TOOL_PROP_BOOLEAN,
+    TOOL_PROP_NULL,
+} tool_prop_type;
+
 typedef struct {
     char *name;
     char *wire_name;
@@ -560,6 +571,7 @@ typedef struct {
      * happens to be named "tool_search". */
     bool responses_tool_search;
     char **prop;
+    tool_prop_type *prop_type;
     int len;
     int cap;
 } tool_schema_order;
@@ -732,6 +744,7 @@ static void tool_schema_order_free(tool_schema_order *o) {
     free(o->namespace);
     for (int i = 0; i < o->len; i++) free(o->prop[i]);
     free(o->prop);
+    free(o->prop_type);
     memset(o, 0, sizeof(*o));
 }
 
@@ -741,12 +754,59 @@ static void tool_schema_orders_free(tool_schema_orders *orders) {
     memset(orders, 0, sizeof(*orders));
 }
 
-static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
+static void tool_schema_order_prop_push(tool_schema_order *o, char *prop,
+                                        tool_prop_type type) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
         o->prop = xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
+        o->prop_type = xrealloc(o->prop_type,
+                                (size_t)o->cap * sizeof(o->prop_type[0]));
     }
-    o->prop[o->len++] = prop;
+    o->prop[o->len] = prop;
+    o->prop_type[o->len++] = type;
+}
+
+static tool_prop_type tool_schema_order_prop_type(const tool_schema_order *order,
+                                                  const char *name) {
+    if (!order || !name) return TOOL_PROP_UNKNOWN;
+    for (int i = 0; i < order->len; i++) {
+        if (order->prop[i] && !strcmp(order->prop[i], name)) {
+            return order->prop_type ? order->prop_type[i] : TOOL_PROP_UNKNOWN;
+        }
+    }
+    return TOOL_PROP_UNKNOWN;
+}
+
+static bool tool_prop_type_is_known(tool_prop_type type) {
+    return type != TOOL_PROP_UNKNOWN;
+}
+
+static bool tool_prop_type_is_string(tool_prop_type type) {
+    return type == TOOL_PROP_STRING;
+}
+
+static const tool_schema_order *tool_schema_orders_find(
+    const tool_schema_orders *orders, const char *name);
+
+static tool_prop_type tool_parameter_schema_type(
+        const tool_schema_orders *orders,
+        const char *tool_name,
+        const char *param_name) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, tool_name);
+    return tool_schema_order_prop_type(order, param_name);
+}
+
+static bool tool_parameter_wire_is_string(const tool_schema_orders *orders,
+                                          const char *tool_name,
+                                          const char *param_name,
+                                          bool model_is_string) {
+    tool_prop_type type =
+        tool_parameter_schema_type(orders, tool_name, param_name);
+    /* Repair only the observed unsafe direction: a JSON-typed schema emitted
+     * as DSML string=true. The inverse annotation already carries a valid JSON
+     * string literal and changing its projection would double-quote it. */
+    return tool_prop_type_is_known(type) && !tool_prop_type_is_string(type) ?
+           false : model_is_string;
 }
 
 static int tool_schema_orders_find_index(const tool_schema_orders *orders, const char *name) {
@@ -1429,6 +1489,48 @@ done:
     return out;
 }
 
+static tool_prop_type parse_schema_property_type(const char *json) {
+    const char *p = json ? json : "";
+    json_ws(&p);
+    if (*p != '{') return TOOL_PROP_UNKNOWN;
+    p++;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return TOOL_PROP_UNKNOWN;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return TOOL_PROP_UNKNOWN;
+        }
+        p++;
+        if (!strcmp(key, "type")) {
+            char *type = NULL;
+            bool ok = json_string(&p, &type);
+            free(key);
+            if (!ok) {
+                free(type);
+                return TOOL_PROP_UNKNOWN;
+            }
+            tool_prop_type result = !strcmp(type, "string") ? TOOL_PROP_STRING :
+                !strcmp(type, "array") ? TOOL_PROP_ARRAY :
+                !strcmp(type, "object") ? TOOL_PROP_OBJECT :
+                !strcmp(type, "number") ? TOOL_PROP_NUMBER :
+                !strcmp(type, "integer") ? TOOL_PROP_INTEGER :
+                !strcmp(type, "boolean") ? TOOL_PROP_BOOLEAN :
+                !strcmp(type, "null") ? TOOL_PROP_NULL : TOOL_PROP_UNKNOWN;
+            free(type);
+            return result;
+        }
+        free(key);
+        if (!json_skip_value(&p)) return TOOL_PROP_UNKNOWN;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return TOOL_PROP_UNKNOWN;
+}
+
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
     const char *p = json;
     json_ws(&p);
@@ -1459,8 +1561,14 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
                     return false;
                 }
                 p++;
-                tool_schema_order_prop_push(order, prop);
-                if (!json_skip_value(&p)) return false;
+                char *prop_schema = NULL;
+                if (!json_raw_value(&p, &prop_schema)) {
+                    free(prop);
+                    return false;
+                }
+                tool_schema_order_prop_push(
+                    order, prop, parse_schema_property_type(prop_schema));
+                free(prop_schema);
                 json_ws(&p);
                 if (*p == ',') p++;
                 json_ws(&p);
@@ -2353,6 +2461,182 @@ static void append_json_arg_pair(buf *b, const json_arg *arg) {
     buf_puts(b, ":");
     if (arg->is_string) json_escape(b, arg->value);
     else buf_puts(b, arg->value);
+}
+
+static void json_strict_ws(const char **p) {
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') (*p)++;
+}
+
+static bool json_strict_string(const char **p) {
+    if (**p != '"') return false;
+    (*p)++;
+    while (**p && **p != '"') {
+        unsigned char c = (unsigned char)*(*p)++;
+        if (c < 0x20) return false;
+        if (c != '\\') continue;
+        char esc = *(*p)++;
+        if (!esc) return false;
+        if (esc == 'u') {
+            for (int i = 0; i < 4; i++) {
+                if (!**p || !isxdigit((unsigned char)**p)) return false;
+                (*p)++;
+            }
+        } else if (!strchr("\"\\/bfnrt", esc)) {
+            return false;
+        }
+    }
+    if (**p != '"') return false;
+    (*p)++;
+    return true;
+}
+
+static bool json_strict_number(const char **p) {
+    const char *s = *p;
+    if (*s == '-') s++;
+    if (*s == '0') {
+        s++;
+        if (isdigit((unsigned char)*s)) return false;
+    } else {
+        if (*s < '1' || *s > '9') return false;
+        while (isdigit((unsigned char)*s)) s++;
+    }
+    if (*s == '.') {
+        s++;
+        if (!isdigit((unsigned char)*s)) return false;
+        while (isdigit((unsigned char)*s)) s++;
+    }
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        if (*s == '+' || *s == '-') s++;
+        if (!isdigit((unsigned char)*s)) return false;
+        while (isdigit((unsigned char)*s)) s++;
+    }
+    *p = s;
+    return true;
+}
+
+static bool json_strict_value_at(const char **p, int depth) {
+    if (depth > JSON_MAX_NESTING) return false;
+    json_strict_ws(p);
+    if (**p == '"') return json_strict_string(p);
+    if (**p == '-' || isdigit((unsigned char)**p)) return json_strict_number(p);
+    if (!strncmp(*p, "true", 4)) { *p += 4; return true; }
+    if (!strncmp(*p, "false", 5)) { *p += 5; return true; }
+    if (!strncmp(*p, "null", 4)) { *p += 4; return true; }
+
+    char close;
+    bool object;
+    if (**p == '[') {
+        close = ']';
+        object = false;
+    } else if (**p == '{') {
+        close = '}';
+        object = true;
+    } else {
+        return false;
+    }
+    (*p)++;
+    json_strict_ws(p);
+    if (**p == close) { (*p)++; return true; }
+    for (;;) {
+        if (object) {
+            if (!json_strict_string(p)) return false;
+            json_strict_ws(p);
+            if (**p != ':') return false;
+            (*p)++;
+        }
+        if (!json_strict_value_at(p, depth + 1)) return false;
+        json_strict_ws(p);
+        if (**p == close) { (*p)++; return true; }
+        if (**p != ',') return false;
+        (*p)++;
+        json_strict_ws(p);
+    }
+}
+
+static bool json_strict_value(const char *text) {
+    const char *p = text ? text : "";
+    if (!json_strict_value_at(&p, 0)) return false;
+    json_strict_ws(&p);
+    return *p == '\0';
+}
+
+static bool json_text_matches_tool_prop_type(const char *text,
+                                             tool_prop_type type) {
+    const char *p = text ? text : "";
+    json_ws(&p);
+    switch (type) {
+    case TOOL_PROP_ARRAY:
+        if (*p != '[') return false;
+        break;
+    case TOOL_PROP_OBJECT:
+        if (*p != '{') return false;
+        break;
+    case TOOL_PROP_NUMBER:
+    case TOOL_PROP_INTEGER:
+        if (*p != '-' && !isdigit((unsigned char)*p)) return false;
+        break;
+    case TOOL_PROP_BOOLEAN:
+        if (strncmp(p, "true", 4) && strncmp(p, "false", 5)) return false;
+        break;
+    case TOOL_PROP_NULL:
+        if (strncmp(p, "null", 4)) return false;
+        break;
+    default:
+        return false;
+    }
+
+    bool ok = json_strict_value(p);
+    if (ok && type == TOOL_PROP_INTEGER) {
+        ok = !strchr(p, '.') && !strchr(p, 'e') && !strchr(p, 'E');
+    }
+    return ok;
+}
+
+static void tool_calls_apply_schema_types(tool_calls *calls,
+                                          const tool_schema_orders *orders) {
+    if (!calls || !orders) return;
+    for (int ci = 0; ci < calls->len; ci++) {
+        tool_call *call = &calls->v[ci];
+        const tool_schema_order *order =
+            tool_schema_orders_find(orders, call->name);
+        if (!order) continue;
+
+        json_args args = {0};
+        if (!json_args_parse(call->arguments, &args)) continue;
+        bool changed = false;
+        for (int i = 0; i < args.len; i++) {
+            tool_prop_type type =
+                tool_schema_order_prop_type(order, args.v[i].key);
+            if (!args.v[i].is_string || type == TOOL_PROP_STRING ||
+                type == TOOL_PROP_UNKNOWN ||
+                !json_text_matches_tool_prop_type(args.v[i].value, type)) {
+                continue;
+            }
+            char *min = json_minify_raw_value(args.v[i].value);
+            if (!min || !min[0]) {
+                free(min);
+                continue;
+            }
+            free(args.v[i].value);
+            args.v[i].value = min;
+            args.v[i].is_string = false;
+            changed = true;
+        }
+
+        if (changed) {
+            buf normalized = {0};
+            buf_putc(&normalized, '{');
+            for (int i = 0; i < args.len; i++) {
+                if (i) buf_putc(&normalized, ',');
+                append_json_arg_pair(&normalized, &args.v[i]);
+            }
+            buf_putc(&normalized, '}');
+            free(call->arguments);
+            call->arguments = buf_take(&normalized);
+        }
+        json_args_free(&args);
+    }
 }
 
 static void append_json_object_or_empty(buf *b, const char *json) {
@@ -5813,6 +6097,11 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    bool param_schema_pending;
+    tool_prop_type param_schema_type;
+    char *param_name;
+    buf param_buffer;
+    char *tool_name;
     char **ids;
     int ids_cap;
 } openai_tool_stream;
@@ -5835,6 +6124,11 @@ static void openai_stream_start(const request *r, openai_stream *st) {
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
     if (!ts) return;
+    free(ts->param_name);
+    ts->param_name = NULL;
+    buf_free(&ts->param_buffer);
+    free(ts->tool_name);
+    ts->tool_name = NULL;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
     ts->ids = NULL;
@@ -6475,6 +6769,8 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
               openai_tool_emit_args_fragment(fd, r, id, ts, "{", 1);
+    free(ts->tool_name);
+    ts->tool_name = xstrdup(name);
     free(name);
     if (!ok) return false;
 
@@ -6500,13 +6796,24 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
         free(is_string);
         return openai_tool_stream_fail(ts);
     }
-    bool string_value = !strcmp(is_string, "true");
-    bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
-    free(name);
+    bool model_is_string = !strcmp(is_string, "true");
+    tool_prop_type schema_type = tool_parameter_schema_type(
+        &r->tool_orders, ts->tool_name, name);
+    bool string_value = tool_parameter_wire_is_string(
+        &r->tool_orders, ts->tool_name, name, model_is_string);
+    bool schema_pending = model_is_string && tool_prop_type_is_known(schema_type) &&
+                          !tool_prop_type_is_string(schema_type);
+    bool ok = schema_pending ||
+        openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
+    free(ts->param_name);
+    ts->param_name = name;
     free(is_string);
     if (!ok) return false;
 
     ts->param_is_string = string_value;
+    ts->param_schema_pending = schema_pending;
+    ts->param_schema_type = schema_type;
+    buf_free(&ts->param_buffer);
     ts->parse_pos = (size_t)(tag_end - raw) + 1;
     ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
@@ -6515,6 +6822,42 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
 static bool openai_tool_finish_param(int fd, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t value_end) {
+    if (ts->param_schema_pending) {
+        buf_append(&ts->param_buffer, raw + ts->parse_pos,
+                   value_end - ts->parse_pos);
+        char *encoded = xstrndup(ts->param_buffer.ptr ? ts->param_buffer.ptr : "",
+                                 ts->param_buffer.len);
+        char *value = dsml_unescape_text(encoded);
+        bool valid = json_text_matches_tool_prop_type(
+            value, ts->param_schema_type);
+        if (!openai_tool_emit_param_prefix(fd, r, id, ts, ts->param_name,
+                                           !valid)) {
+            free(encoded);
+            free(value);
+            return false;
+        }
+        bool ok;
+        if (valid) {
+            char *min = json_minify_raw_value(value);
+            ok = openai_tool_emit_args_fragment(fd, r, id, ts,
+                                                min ? min : value,
+                                                strlen(min ? min : value));
+            free(min);
+        } else {
+            ok = openai_tool_emit_string_value(fd, r, id, ts,
+                                               encoded, strlen(encoded)) &&
+                 openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1);
+        }
+        free(encoded);
+        free(value);
+        if (!ok) return false;
+        ts->param_schema_pending = false;
+        ts->param_is_string = !valid;
+        buf_free(&ts->param_buffer);
+        ts->parse_pos = value_end + strlen(ts->param_end);
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+        return true;
+    }
     if (value_end > ts->parse_pos) {
         bool ok = ts->param_is_string ?
             openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
@@ -6585,6 +6928,16 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
                 if (!openai_tool_finish_param(fd, r, id, ts, raw,
                                               (size_t)(end - raw))) return false;
                 continue;
+            }
+            if (ts->param_schema_pending) {
+                size_t limit = tool_param_value_stream_safe_len(
+                    raw, ts->parse_pos, raw_len, ts->param_end, true);
+                if (limit > ts->parse_pos) {
+                    buf_append(&ts->param_buffer, raw + ts->parse_pos,
+                               limit - ts->parse_pos);
+                    ts->parse_pos = limit;
+                }
+                return true;
             }
             size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
                                                             raw_len, ts->param_end,
@@ -7707,6 +8060,11 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    bool param_schema_pending;
+    tool_prop_type param_schema_type;
+    char *param_name;
+    buf param_buffer;
+    char *tool_name;
     char **ids;
     int ids_cap;
 } anthropic_tool_stream;
@@ -7752,6 +8110,11 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
 
 static void anthropic_tool_stream_free(anthropic_tool_stream *ts) {
     if (!ts) return;
+    free(ts->param_name);
+    ts->param_name = NULL;
+    buf_free(&ts->param_buffer);
+    free(ts->tool_name);
+    ts->tool_name = NULL;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
     free(ts->ids);
     ts->ids = NULL;
@@ -8002,6 +8365,8 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
     const char *tool_id = anthropic_tool_stream_id(s, ts, ts->index);
     bool ok = anthropic_sse_open_tool_block(fd, st, tool_id, name) &&
               anthropic_tool_emit_args_fragment(fd, st, "{", 1);
+    free(ts->tool_name);
+    ts->tool_name = xstrdup(name);
     free(name);
     if (!ok) return false;
 
@@ -8013,7 +8378,8 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
     return true;
 }
 
-static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
+static bool anthropic_tool_start_param(int fd, const request *r,
+                                       anthropic_stream *st,
                                        const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
@@ -8028,13 +8394,24 @@ static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
         free(is_string);
         return anthropic_tool_stream_fail(ts);
     }
-    bool string_value = !strcmp(is_string, "true");
-    bool ok = anthropic_tool_emit_param_prefix(fd, st, name, string_value);
-    free(name);
+    bool model_is_string = !strcmp(is_string, "true");
+    tool_prop_type schema_type = tool_parameter_schema_type(
+        &r->tool_orders, ts->tool_name, name);
+    bool string_value = tool_parameter_wire_is_string(
+        &r->tool_orders, ts->tool_name, name, model_is_string);
+    bool schema_pending = model_is_string && tool_prop_type_is_known(schema_type) &&
+                          !tool_prop_type_is_string(schema_type);
+    bool ok = schema_pending ||
+        anthropic_tool_emit_param_prefix(fd, st, name, string_value);
+    free(ts->param_name);
+    ts->param_name = name;
     free(is_string);
     if (!ok) return false;
 
     ts->param_is_string = string_value;
+    ts->param_schema_pending = schema_pending;
+    ts->param_schema_type = schema_type;
+    buf_free(&ts->param_buffer);
     ts->parse_pos = (size_t)(tag_end - raw) + 1;
     ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
@@ -8043,6 +8420,42 @@ static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
 static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
                                         const char *raw, size_t value_end) {
     anthropic_tool_stream *ts = &st->tool;
+    if (ts->param_schema_pending) {
+        buf_append(&ts->param_buffer, raw + ts->parse_pos,
+                   value_end - ts->parse_pos);
+        char *encoded = xstrndup(ts->param_buffer.ptr ? ts->param_buffer.ptr : "",
+                                 ts->param_buffer.len);
+        char *value = dsml_unescape_text(encoded);
+        bool valid = json_text_matches_tool_prop_type(
+            value, ts->param_schema_type);
+        if (!anthropic_tool_emit_param_prefix(fd, st, ts->param_name,
+                                              !valid)) {
+            free(encoded);
+            free(value);
+            return false;
+        }
+        bool ok;
+        if (valid) {
+            char *min = json_minify_raw_value(value);
+            ok = anthropic_tool_emit_args_fragment(fd, st,
+                                                   min ? min : value,
+                                                   strlen(min ? min : value));
+            free(min);
+        } else {
+            ok = anthropic_tool_emit_string_value(fd, st,
+                                                  encoded, strlen(encoded)) &&
+                 anthropic_tool_emit_args_fragment(fd, st, "\"", 1);
+        }
+        free(encoded);
+        free(value);
+        if (!ok) return false;
+        ts->param_schema_pending = false;
+        ts->param_is_string = !valid;
+        buf_free(&ts->param_buffer);
+        ts->parse_pos = value_end + strlen(ts->syn->param_end);
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+        return true;
+    }
     if (value_end > ts->parse_pos) {
         bool ok = ts->param_is_string ?
             anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
@@ -8058,7 +8471,8 @@ static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
     return true;
 }
 
-static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
+static bool anthropic_tool_stream_update(int fd, server *s, const request *r,
+                                         const char *id,
                                          anthropic_stream *st,
                                          const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
@@ -8102,7 +8516,7 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->param_start)) {
                 size_t before_pos = ts->parse_pos;
                 dsml_tool_stream_state before_state = ts->state;
-                if (!anthropic_tool_start_param(fd, st, raw, raw_len)) return false;
+                if (!anthropic_tool_start_param(fd, r, st, raw, raw_len)) return false;
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
             }
@@ -8117,6 +8531,16 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
                 if (!anthropic_tool_finish_param(fd, st, raw,
                                                  (size_t)(end - raw))) return false;
                 continue;
+            }
+            if (ts->param_schema_pending) {
+                size_t limit = tool_param_value_stream_safe_len(
+                    raw, ts->parse_pos, raw_len, ts->syn->param_end, true);
+                if (limit > ts->parse_pos) {
+                    buf_append(&ts->param_buffer, raw + ts->parse_pos,
+                               limit - ts->parse_pos);
+                    ts->parse_pos = limit;
+                }
+                return true;
             }
             size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
                                                             raw_len,
@@ -8268,7 +8692,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     }
 
     if (st->mode == ANTH_STREAM_TOOL) {
-        if (!anthropic_tool_stream_update(fd, s, id, st, raw, raw_len)) return false;
+        if (!anthropic_tool_stream_update(fd, s, r, id, st, raw, raw_len)) return false;
         if (!st->tool.active) st->mode = ANTH_STREAM_SUPPRESS;
     }
     return true;
@@ -12089,6 +12513,9 @@ decode_again:
             &parsed_reasoning,
             &parsed_calls,
             &recovered_tool_parse_failure);
+        if (parsed_ok) {
+            tool_calls_apply_schema_types(&parsed_calls, &j->req.tool_orders);
+        }
         if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
             /* parse_generated_message failed even though DSML was present.
              * Semantic repair is intentionally avoided: if the parser cannot
@@ -13844,6 +14271,14 @@ static tool_schema_orders make_bash_order(void) {
     return orders;
 }
 
+static tool_schema_orders make_todowrite_order(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"todowrite\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"todos\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}}}}");
+    return orders;
+}
+
 static char *read_socket_text(int fd) {
     buf b = {0};
     char tmp[1024];
@@ -14431,6 +14866,80 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     free(out);
     free(parsed_content);
     free(parsed_reasoning);
+    tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_uses_schema_for_array_arguments(void) {
+    TEST_ASSERT(json_text_matches_tool_prop_type(
+        "[{\"content\":\"x\"}]", TOOL_PROP_ARRAY));
+    TEST_ASSERT(!json_text_matches_tool_prop_type(
+        "[],\"unexpected\":true", TOOL_PROP_ARRAY));
+    TEST_ASSERT(!json_text_matches_tool_prop_type("[01]", TOOL_PROP_ARRAY));
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.tool_orders = make_todowrite_order();
+    const tool_schema_order *order =
+        tool_schema_orders_find(&r.tool_orders, "todowrite");
+    TEST_ASSERT(tool_schema_order_prop_type(order, "todos") == TOOL_PROP_ARRAY);
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw_partial =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"todowrite\">\n"
+        DS4_PARAM_START " name=\"todos\" string=\"true\">"
+        "[{\"content\":\"x\"";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_array", &st,
+                                         raw_partial, strlen(raw_partial), false));
+    TEST_ASSERT(st.tool.param_schema_pending);
+    TEST_ASSERT(st.tool.param_buffer.len > 0);
+
+    const char *raw =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"todowrite\">\n"
+        DS4_PARAM_START " name=\"todos\" string=\"true\">"
+        "[{\"content\":\"x\",\"status\":\"pending\",\"priority\":\"high\"}]"
+        DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_array", &st,
+                                         raw, strlen(raw), false));
+    TEST_ASSERT(!st.tool.param_is_string);
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(raw, false, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"todos\": \"[") != NULL);
+    tool_calls_apply_schema_types(&calls, &r.tool_orders);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"todos\":[{") != NULL);
+    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_array", &st,
+                                       raw, strlen(raw), &calls,
+                                       "tool_calls", 10, 4));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\\\"todos\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"todos\\\":\\\"") == NULL);
+    TEST_ASSERT(strstr(out, "[{\\\"content\\\":\\\"x\\\"") != NULL);
+
+    free(out);
+    free(content);
+    free(reasoning);
     tool_calls_free(&calls);
     openai_stream_free(&st);
     request_free(&r);
@@ -17936,6 +18445,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
+    test_openai_tool_stream_uses_schema_for_array_arguments();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
